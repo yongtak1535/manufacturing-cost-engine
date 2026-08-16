@@ -1,0 +1,9 @@
+PHASE 1 VALIDATION
+파일 수: 23
+WO: 20
+Production Output: 19
+Material Issue: 62
+Labor: 54
+GL: 44
+Error Catalog: 32
+Duplicate SHA-256 match: True
