@@ -1,41 +1,70 @@
-from __future__ import annotations
 from pathlib import Path
-from hashlib import sha256
-import pandas as pd
 
-EXCLUDED_PREFIXES = ("90_", "91_")
+from openpyxl import load_workbook
 
-def file_sha256(path: Path) -> str:
-    h = sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
-def excel_files(dataset_dir: str | Path) -> list[Path]:
-    root = Path(dataset_dir)
-    return sorted(
-        p for p in root.glob("*.xlsx")
-        if not p.name.startswith(EXCLUDED_PREFIXES)
+def load_excel_file(file_path: str | Path) -> dict[str, list[dict]]:
+    """
+    Load an Excel workbook.
+
+    Returns:
+        {
+            "sheet_name": [
+                {"column": value, ...},
+                ...
+            ]
+        }
+    """
+    path = Path(file_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    workbook = load_workbook(
+        filename=path,
+        data_only=True,
     )
 
-def load_workbook(path: Path) -> dict[str, pd.DataFrame]:
-    return pd.read_excel(path, sheet_name=None, dtype=object)
+    result = {}
 
-def normalize_sheet(df: pd.DataFrame) -> list[dict]:
-    # Excel row 1 is header, so data row numbering starts at 2.
-    df = df.where(pd.notna(df), None)
-    rows = []
-    for idx, row in df.iterrows():
-        record = row.to_dict()
-        record["_source_row"] = int(idx) + 2
-        rows.append(record)
-    return rows
+    for worksheet in workbook.worksheets:
+        rows = list(
+            worksheet.iter_rows(
+                values_only=True
+            )
+        )
 
-def load_dataset(dataset_dir: str | Path) -> dict[str, list[dict]]:
-    result: dict[str, list[dict]] = {}
-    for path in excel_files(dataset_dir):
-        for sheet, df in load_workbook(path).items():
-            key = f"{path.name}::{sheet}"
-            result[key] = normalize_sheet(df)
+        if not rows:
+            result[worksheet.title] = []
+            continue
+
+        headers = [
+            str(value).strip() if value is not None else ""
+            for value in rows[0]
+        ]
+
+        if any(not header for header in headers):
+            raise ValueError(
+                f"Empty header detected: "
+                f"{path.name} / {worksheet.title}"
+            )
+
+        data = []
+
+        for row_number, row in enumerate(rows[1:], start=2):
+            if all(value is None for value in row):
+                continue
+
+            record = {
+                header: value
+                for header, value in zip(headers, row)
+            }
+
+            record["_source_row"] = row_number
+            record["_source_sheet_name"] = worksheet.title
+
+            data.append(record)
+
+        result[worksheet.title] = data
+
     return result
