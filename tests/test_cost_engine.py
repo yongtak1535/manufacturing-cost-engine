@@ -54,3 +54,25 @@ def test_unit_cost_zero_quantity():
             total_cost=100000,
             production_quantity=0,
         )
+def test_round_half_up():
+    result = calculate_material_cost(3, "1.005")
+
+    assert result == Decimal("3.02")
+
+
+def test_material_cost_with_none_quantity():
+    result = calculate_material_cost(None, 100)
+
+    assert result == Decimal("0.00")
+
+
+def test_labor_cost_decimal_input():
+    result = calculate_labor_cost("1.005", "1")
+
+    assert result == Decimal("1.01")
+
+
+def test_overhead_cost_decimal_input():
+    result = calculate_overhead_cost("100", "0.015")
+
+    assert result == Decimal("1.50")
