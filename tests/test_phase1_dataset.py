@@ -79,3 +79,51 @@ def test_phase1_loaded_rows_have_source_row():
         "_source_row" in row
         for row in loaded_rows
     )
+def test_phase1_dataset_has_expected_scale():
+    data = load_dataset(DATASET_DIR)
+
+    # 20개 로딩 대상 Excel
+    files = excel_files(DATASET_DIR)
+
+    assert len(files) == 20
+
+    # 주요 거래 데이터가 실제로 로드되었는지 확인
+    assert len(data["20_work_order.xlsx::work_order"]) == 20
+    assert len(data["21_production_output.xlsx::production_output"]) == 19
+    assert len(data["22_material_issue.xlsx::material_issue"]) == 62
+    assert len(data["23_labor_transaction.xlsx::labor_transaction"]) == 54
+    assert len(data["24_gl_transaction.xlsx::gl_transaction"]) == 44
+
+
+def test_phase1_dataset_excludes_test_fixtures():
+    files = excel_files(DATASET_DIR)
+
+    filenames = {path.name for path in files}
+
+    assert "90_expected_results.xlsx" not in filenames
+    assert "91_error_catalog.xlsx" not in filenames
+
+
+def test_phase1_dataset_contains_required_sheets():
+    data = load_dataset(DATASET_DIR)
+
+    required_sheets = {
+        "01_company_plant.xlsx::company",
+        "01_company_plant.xlsx::plant",
+        "02_period.xlsx::period",
+        "07_product_master.xlsx::product",
+        "08_material_master.xlsx::material",
+        "10_bom.xlsx::bom_version",
+        "10_bom.xlsx::bom_item",
+        "11_routing.xlsx::routing_version",
+        "11_routing.xlsx::routing_operation",
+        "12_standard_cost.xlsx::standard_cost",
+        "12_standard_cost.xlsx::standard_cost_detail",
+        "20_work_order.xlsx::work_order",
+        "21_production_output.xlsx::production_output",
+        "22_material_issue.xlsx::material_issue",
+        "23_labor_transaction.xlsx::labor_transaction",
+        "24_gl_transaction.xlsx::gl_transaction",
+    }
+
+    assert required_sheets.issubset(data.keys())
