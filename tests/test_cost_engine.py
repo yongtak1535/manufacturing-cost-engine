@@ -14,6 +14,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_actual_total_cost_by_wo,
     calculate_actual_unit_cost_by_wo,
     calculate_total_variance_by_wo,
+    calculate_material_price_quantity_variance_by_wo,
 )
 
 
@@ -128,6 +129,15 @@ def _standard_cost(product_code="P-100", period_key="2026-07",
     return {
         "product_code": product_code, "period_key": period_key,
         "cost_element_code": cost_element_code, "standard_amount": standard_amount,
+    }
+
+def _standard_cost_detail(product_code="P-100", period_key="2026-07", ref_type="MATERIAL",
+                           ref_material_code="MAT-001", standard_qty="1",
+                           standard_unit_price="100"):
+    return {
+        "product_code": product_code, "period_key": period_key, "ref_type": ref_type,
+        "ref_material_code": ref_material_code, "standard_qty": standard_qty,
+        "standard_unit_price": standard_unit_price,
     }
 
 
@@ -451,3 +461,150 @@ def test_total_variance_by_wo_decimal_precision():
     # issued_qty(1) x unit_cost(100.015) = 100.015 -> ROUND_HALF_UP -> 100.02
     assert wo["actual_material_cost"] == Decimal("100.02")
     assert wo["dm_variance"] == Decimal("0.01")
+
+
+# --- calculate_material_price_quantity_variance_by_wo (DM PV/QV) ---
+
+def test_pv_qv_zero_when_actual_matches_standard():
+    # 실제 WO-2607-005/010/013과 동일한 패턴: AP=SP, AQ=flexed SQ -> PV=QV=0.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="10", unit_cost="100")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    wo = result["WO-1"]
+    assert wo["price_variance_total"] == Decimal("0.00")
+    assert wo["quantity_variance_total"] == Decimal("0.00")
+    mat = wo["materials"]["MAT-001"]
+    assert mat["actual_qty"] == Decimal("10")
+    assert mat["flexed_standard_qty"] == Decimal("10")
+
+def test_pv_qv_price_variance_only():
+    # 실제 WO-2607-004/MAT-009와 동일한 패턴: 수량은 표준과 같지만 단가만 다름.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="10", unit_cost="90")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    wo = result["WO-1"]
+    assert wo["price_variance_total"] == Decimal("-100.00")
+    assert wo["quantity_variance_total"] == Decimal("0.00")
+
+def test_pv_qv_no_actual_defaults_to_zero_and_reports_unfavorable_qv():
+    # 실제 WO-2607-019와 동일한 패턴: 실적 거래가 전혀 없는 WO도 Actual=0으로
+    # 계산되고(제외되지 않음) QV는 flexed 표준 전체만큼 불리하게 나온다.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    wo = result["WO-1"]
+    assert wo["price_variance_total"] == Decimal("0.00")
+    assert wo["quantity_variance_total"] == Decimal("-1000.00")
+    mat = wo["materials"]["MAT-001"]
+    assert mat["actual_qty"] == Decimal("0")
+    assert mat["actual_cost"] == Decimal("0")
+
+def test_pv_qv_excludes_wo_with_no_material_detail_at_all():
+    # 실제 P-100/P-300/P-400/P-900처럼 ref_type=MATERIAL detail이 전혀 없는
+    # 제품은 0으로 채우지 않고 결과에서 제외한다.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="10", unit_cost="100")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [],
+    )
+    assert result == {}
+
+def test_pv_qv_excludes_zero_good_qty():
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="10", unit_cost="100")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="0")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    assert result == {}
+
+def test_pv_qv_ignores_non_material_ref_type():
+    # standard_cost_detail에 ref_type=OPERATION만 있으면(자재별 표준 없음)
+    # ref_type=MATERIAL 한정 원칙에 따라 계산 대상이 아니다.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="10", unit_cost="100")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_type="OPERATION", ref_material_code="MAT-001",
+                                standard_qty="1", standard_unit_price="100")],
+    )
+    assert result == {}
+
+def test_pv_qv_excludes_material_without_standard_but_keeps_others():
+    # standard_cost_detail에 없는 자재(MAT-002)가 issue되어도 그 자재는
+    # breakdown에서 제외되고, 표준이 있는 MAT-001은 정상 계산된다.
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [
+            _issue(material_code="MAT-001", issued_qty="10", unit_cost="100"),
+            _issue(material_code="MAT-002", issued_qty="5", unit_cost="50"),
+        ],
+        [_material("MAT-001"), _material("MAT-002")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    wo = result["WO-1"]
+    assert set(wo["materials"].keys()) == {"MAT-001"}
+    assert wo["price_variance_total"] == Decimal("0.00")
+    assert wo["quantity_variance_total"] == Decimal("0.00")
+
+def test_pv_qv_return_issue_nets_quantity_and_cost():
+    # RETURN 행이 수량과 금액 모두에서 순액으로 반영되는지 확인한다
+    # (calculate_actual_material_cost()의 net 처리 규칙과 동일해야 함).
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [
+            _issue(material_code="MAT-001", issued_qty="15", unit_cost="100", issue_type="ISSUE"),
+            _issue(material_code="MAT-001", issued_qty="2", unit_cost="100", issue_type="RETURN"),
+        ],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="100")],
+    )
+    mat = result["WO-1"]["materials"]["MAT-001"]
+    assert mat["actual_qty"] == Decimal("13")
+    assert mat["actual_cost"] == Decimal("1300.00")
+    # flexed_standard_qty = 1 x good_qty(10) = 10 -> QV = (13-10) x 100 = 300.00 (불리)
+    assert mat["quantity_variance"] == Decimal("300.00")
+    # AP=SP(100)이므로 PV=0
+    assert mat["price_variance"] == Decimal("0.00")
+
+def test_pv_qv_decimal_precision():
+    result = calculate_material_price_quantity_variance_by_wo(
+        [_wo()],
+        [_issue(material_code="MAT-001", issued_qty="3", unit_cost="33.335")],
+        [_material("MAT-001")],
+        [_product()],
+        [_production_output(good_qty="3")],
+        [_standard_cost_detail(ref_material_code="MAT-001", standard_qty="1", standard_unit_price="33.34")],
+    )
+    mat = result["WO-1"]["materials"]["MAT-001"]
+    # issued_qty(3) x unit_cost(33.335) = 100.005 -> ROUND_HALF_UP -> 100.01
+    assert mat["actual_cost"] == Decimal("100.01")
+    # PV = 100.01 - (33.34 x 3 = 100.02) = -0.01
+    assert mat["price_variance"] == Decimal("-0.01")
+    assert mat["quantity_variance"] == Decimal("0.00")

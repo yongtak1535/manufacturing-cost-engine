@@ -11,7 +11,10 @@ from .validation import (
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files
 )
-from .cost_engine import calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo
+from .cost_engine import (
+    calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
+    calculate_material_price_quantity_variance_by_wo,
+)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -172,6 +175,19 @@ def main():
     for wo_no in sorted(variance_by_wo):
         v = variance_by_wo[wo_no]
         print(f"  {wo_no}: total_variance={v['total_variance']}")
+
+    pv_qv_by_wo = calculate_material_price_quantity_variance_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("08_material_master.xlsx", "material"),
+        products,
+        production_outputs,
+        rows("12_standard_cost.xlsx", "standard_cost_detail"),
+    )
+    print(f"DM Price/Quantity Variance calculated for {len(pv_qv_by_wo)} work order(s)")
+    for wo_no in sorted(pv_qv_by_wo):
+        v = pv_qv_by_wo[wo_no]
+        print(f"  {wo_no}: price_variance={v['price_variance_total']}, quantity_variance={v['quantity_variance_total']}")
 
 if __name__ == "__main__":
     main()

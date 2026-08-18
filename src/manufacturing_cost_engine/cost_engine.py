@@ -434,3 +434,170 @@ def calculate_total_variance_by_wo(
         result[wo_no] = entry
 
     return result
+
+
+def _actual_material_qty_and_cost_by_wo_material(
+    work_orders,
+    material_issues,
+    materials,
+    products,
+):
+    """
+    calculate_actual_material_cost()와 동일한 필터링 규칙(유효 WO/product,
+    material master 등록 여부, issued_qty/unit_cost 파싱 가능 여부, RETURN 시
+    net 처리)을 (wo_no, material_code) 단위로 적용한다 — DM PV/QV 분해를 위해
+    자재별로 쪼갠 결과가 필요하므로, calculate_actual_material_cost() 자체는
+    수정하지 않고 이 헬퍼를 별도로 둔다.
+    """
+    valid_wo_nos = _valid_work_order_nos(work_orders, products)
+    material_codes = {m.get("material_code") for m in materials}
+
+    totals: dict[tuple, dict] = {}
+
+    for r in material_issues:
+        wo_no = r.get("wo_no")
+        if wo_no not in valid_wo_nos:
+            continue
+
+        material_code = r.get("material_code")
+        if material_code not in material_codes:
+            continue
+
+        qty = _strict_decimal(r.get("issued_qty"))
+        unit_cost = _strict_decimal(r.get("unit_cost"))
+        if qty is None or unit_cost is None:
+            continue
+
+        line_amount = calculate_material_cost(qty, unit_cost)
+        line_qty = qty
+        if r.get("issue_type") == "RETURN":
+            line_amount = -line_amount
+            line_qty = -qty
+
+        entry = totals.setdefault((wo_no, material_code), {"qty": Decimal("0"), "cost": Decimal("0")})
+        entry["qty"] += line_qty
+        entry["cost"] += line_amount
+
+    return totals
+
+
+def calculate_material_price_quantity_variance_by_wo(
+    work_orders,
+    material_issues,
+    materials,
+    products,
+    production_outputs,
+    standard_cost_detail,
+) -> dict[str, dict]:
+    """
+    Phase 1 DM Price/Quantity Variance. `standard_cost_detail`의 `ref_type
+    == "MATERIAL"` 행에 한정한다(현재 데이터에는 이 행이 P-200 DM 3건뿐).
+
+    PV = Actual 자재비 − SP × AQ   (= (AP − SP) × AQ와 동치)
+    QV = (AQ − SQ_flexed) × SP
+    SQ_flexed = standard_cost_detail.standard_qty(제품 1단위당) × 해당 WO의
+    good_qty 합계 — calculate_total_variance_by_wo()와 동일한 flex 방식.
+
+    설계문서(§7-4)가 명시한 대로 PV + QV는 Total Variance(또는 DM Variance)와
+    일치하지 않을 수 있다(교차항이 PV에 흡수됨 + standard_cost_detail 합계와
+    header standard_amount의 기존 STD_DETAIL_SUM_MISMATCH 격차). 이 함수는
+    그 값을 맞추기 위한 어떤 보정도 하지 않는다.
+
+    다음은 결과에서 생략한다(0으로 채우지 않음 — 계산 불가와 0은 다르다):
+      - 제품+기간에 ref_type=MATERIAL인 standard_cost_detail 행이 하나도
+        없는 WO(자재별 표준 자체가 없어 구조적으로 계산 불가)
+      - good_qty가 없거나 0인 WO
+
+    standard_cost_detail에 없는 자재가 issue된 경우 그 자재는 breakdown에서
+    제외되고(PV/QV 범위 밖), 표준이 있는 나머지 자재는 정상 계산된다.
+    """
+    good_qty_by_wo: dict[str, Decimal] = {}
+    for po in production_outputs:
+        wo_no = po.get("wo_no")
+        qty = _strict_decimal(po.get("good_qty"))
+        if wo_no is None or qty is None:
+            continue
+        good_qty_by_wo[wo_no] = good_qty_by_wo.get(wo_no, Decimal("0")) + qty
+
+    standard_by_key: dict[tuple, dict] = {}
+    for d in standard_cost_detail:
+        if d.get("ref_type") != "MATERIAL":
+            continue
+
+        product_code = d.get("product_code")
+        period_key = d.get("period_key")
+        material_code = d.get("ref_material_code")
+        if product_code is None or period_key is None or material_code is None:
+            continue
+
+        std_qty = _strict_decimal(d.get("standard_qty"))
+        std_price = _strict_decimal(d.get("standard_unit_price"))
+        if std_qty is None or std_price is None:
+            continue
+
+        standard_by_key[(product_code, period_key, material_code)] = {
+            "standard_qty": std_qty,
+            "standard_unit_price": std_price,
+        }
+
+    actual_by_wo_material = _actual_material_qty_and_cost_by_wo_material(
+        work_orders, material_issues, materials, products,
+    )
+
+    zero = Decimal("0")
+    result: dict[str, dict] = {}
+
+    for wo in work_orders:
+        wo_no = wo.get("wo_no")
+        if wo_no is None:
+            continue
+
+        good_qty = good_qty_by_wo.get(wo_no)
+        if not good_qty:
+            continue
+
+        product_code = wo.get("product_code")
+        period_key = wo.get("period_key")
+
+        material_standards = {
+            key[2]: std for key, std in standard_by_key.items()
+            if key[0] == product_code and key[1] == period_key
+        }
+        if not material_standards:
+            continue
+
+        materials_result = {}
+        price_variances = []
+        quantity_variances = []
+
+        for material_code, std in material_standards.items():
+            flexed_sq = std["standard_qty"] * good_qty
+            sp = std["standard_unit_price"]
+
+            actual = actual_by_wo_material.get(
+                (wo_no, material_code), {"qty": zero, "cost": zero}
+            )
+            aq = actual["qty"]
+            actual_cost = actual["cost"]
+
+            price_variance = round_amount(actual_cost - sp * aq)
+            quantity_variance = round_amount((aq - flexed_sq) * sp)
+
+            materials_result[material_code] = {
+                "actual_qty": aq,
+                "actual_cost": actual_cost,
+                "flexed_standard_qty": flexed_sq,
+                "standard_unit_price": sp,
+                "price_variance": price_variance,
+                "quantity_variance": quantity_variance,
+            }
+            price_variances.append(price_variance)
+            quantity_variances.append(quantity_variance)
+
+        result[wo_no] = {
+            "materials": materials_result,
+            "price_variance_total": round_amount(sum(price_variances, Decimal("0"))),
+            "quantity_variance_total": round_amount(sum(quantity_variances, Decimal("0"))),
+        }
+
+    return result
