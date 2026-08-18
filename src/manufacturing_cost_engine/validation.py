@@ -290,3 +290,152 @@ def validate_bom_issues(work_orders, bom_items, material_issues, materials,
                 ))
 
     return issues
+
+def _index_routing_versions(routing_versions):
+    """routing_version_id -> routing_version(header) row"""
+    index = {}
+    for h in routing_versions:
+        rvid = h.get("routing_version_id")
+        if rvid is not None:
+            index[rvid] = h
+    return index
+
+def _index_routing_operations(routing_operations):
+    """routing_version_id -> [routing_operation rows]"""
+    index = defaultdict(list)
+    for op in routing_operations:
+        rvid = op.get("routing_version_id")
+        if rvid is not None:
+            index[rvid].append(op)
+    return index
+
+def validate_routing(work_orders, routing_versions, routing_operations, work_centers):
+    """
+    11_routing.xlsx(routing_version/routing_operation) 마스터 무결성과
+    Work Order.product_code ↔ Routing 연결을 검증한다.
+
+    참고: 실제 20_work_order.xlsx에는 routing_version_id 컬럼이 없다
+    (bom_version_id와 달리 스냅샷 컬럼이 아직 없음). 따라서 WO는
+    product_code를 통해서만 routing_version과 연결된다. WO 행에
+    routing_version_id가 명시적으로 존재하는 경우(향후 스키마 확장 대비)에는
+    그 값을 우선 사용해 header.product_code와 대사한다.
+    """
+    issues = []
+
+    header_index = _index_routing_versions(routing_versions)
+    operations_by_version = _index_routing_operations(routing_operations)
+    work_center_codes = {
+        wc.get("work_center_code") for wc in work_centers if wc.get("work_center_code")
+    }
+
+    # --- Work Order <-> Routing header 연결 (product_code 기준) ---
+    for wo in work_orders:
+        wo_no = wo.get("wo_no")
+        product_code = wo.get("product_code")
+        explicit_rvid = wo.get("routing_version_id")
+
+        if explicit_rvid is not None:
+            header = header_index.get(explicit_rvid)
+            if header is None:
+                issues.append(_issue(
+                    "UNKNOWN_ROUTING", "CRITICAL", "20_work_order.xlsx", "work_order",
+                    wo.get("_source_row"),
+                    f"존재하지 않는 routing_version_id: {explicit_rvid}", wo_no
+                ))
+            elif header.get("product_code") != product_code:
+                issues.append(_issue(
+                    "ROUTING_PRODUCT_MISMATCH", "ERROR", "20_work_order.xlsx", "work_order",
+                    wo.get("_source_row"),
+                    f"WO product_code={product_code}, routing({explicit_rvid}) "
+                    f"product_code={header.get('product_code')}", wo_no
+                ))
+            continue
+
+        if not any(h.get("product_code") == product_code for h in routing_versions):
+            issues.append(_issue(
+                "UNKNOWN_ROUTING", "CRITICAL", "20_work_order.xlsx", "work_order",
+                wo.get("_source_row"),
+                f"product_code={product_code}에 대응하는 routing이 없습니다.", wo_no
+            ))
+
+    # --- Routing header <-> detail (routing_operation) 관계 ---
+    known_versions = set(header_index)
+    versions_with_ops = set(operations_by_version)
+
+    for rvid in known_versions - versions_with_ops:
+        header = header_index[rvid]
+        issues.append(_issue(
+            "ROUTING_OPERATION_MISSING", "ERROR", "11_routing.xlsx", "routing_version",
+            header.get("_source_row"),
+            f"routing_version_id={rvid}에 등록된 routing_operation이 없습니다.", rvid
+        ))
+
+    for rvid in versions_with_ops - known_versions:
+        for op in operations_by_version[rvid]:
+            issues.append(_issue(
+                "UNKNOWN_ROUTING", "CRITICAL", "11_routing.xlsx", "routing_operation",
+                op.get("_source_row"),
+                f"존재하지 않는 routing_version_id를 참조하는 operation: {rvid}", rvid
+            ))
+
+    # --- Routing operation 행 단위 검증 ---
+    for op in routing_operations:
+        rvid = op.get("routing_version_id")
+        row = op.get("_source_row")
+
+        seq_value = _to_decimal(op.get("operation_seq"))
+        if (
+            seq_value is None
+            or seq_value != seq_value.to_integral_value()
+            or seq_value <= 0
+        ):
+            issues.append(_issue(
+                "INVALID_ROUTING_OPERATION_SEQ", "CRITICAL", "11_routing.xlsx",
+                "routing_operation", row,
+                f"operation_seq가 유효하지 않습니다: {op.get('operation_seq')!r}", rvid
+            ))
+
+        if not op.get("operation_code"):
+            issues.append(_issue(
+                "ROUTING_OPERATION_CODE_MISSING", "ERROR", "11_routing.xlsx",
+                "routing_operation", row,
+                f"operation_code가 비어 있습니다 (routing_version_id={rvid}, "
+                f"operation_seq={op.get('operation_seq')})", rvid
+            ))
+
+        work_center_code = op.get("work_center_code")
+        if not work_center_code:
+            issues.append(_issue(
+                "ROUTING_WORK_CENTER_MISSING", "CRITICAL", "11_routing.xlsx",
+                "routing_operation", row,
+                f"work_center_code가 비어 있습니다 (routing_version_id={rvid}, "
+                f"operation_seq={op.get('operation_seq')})", rvid
+            ))
+        elif work_center_code not in work_center_codes:
+            issues.append(_issue(
+                "UNKNOWN_WORK_CENTER", "CRITICAL", "11_routing.xlsx",
+                "routing_operation", row,
+                f"등록되지 않은 work_center: {work_center_code}", work_center_code
+            ))
+
+        hours = _to_decimal(op.get("standard_hours"))
+        if hours is None:
+            issues.append(_issue(
+                "INVALID_STANDARD_HOURS", "ERROR", "11_routing.xlsx",
+                "routing_operation", row,
+                f"standard_hours가 유효하지 않습니다: {op.get('standard_hours')!r}", rvid
+            ))
+        elif hours < 0:
+            issues.append(_issue(
+                "INVALID_STANDARD_HOURS", "ERROR", "11_routing.xlsx",
+                "routing_operation", row,
+                f"standard_hours가 음수입니다: {hours}", rvid
+            ))
+
+    # --- routing_version_id + operation_seq 자연키 중복 (기존 헬퍼 재사용) ---
+    issues += duplicate_keys(
+        routing_operations, ["routing_version_id", "operation_seq"],
+        "11_routing.xlsx", "routing_operation"
+    )
+
+    return issues
