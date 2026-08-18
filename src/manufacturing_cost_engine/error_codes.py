@@ -33,6 +33,7 @@ ERROR = {
     "STANDARD_COST_MISSING",
     "STD_DETAIL_SUM_MISMATCH",
     "GL_RECON_DIFFERENCE",
+    "INVALID_LABOR_RATE",
 }
 
 WARNING = {
@@ -48,6 +49,7 @@ REVIEW = {
     "UOM_CONVERSION_MISSING",
     "REWORK_REVIEW_REQUIRED",
     "EXCLUDED_WO",
+    "BOM_VERSION_AMBIGUOUS",
 }
 
 # 분모(생산량)가 없어 단위원가를 계산할 수 없는 경우. 0%/0원 등 임의값을 반환하지 않는다.

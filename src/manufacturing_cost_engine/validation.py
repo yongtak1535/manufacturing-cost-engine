@@ -124,6 +124,13 @@ def validate_labor(rows, routing_index,
                    file="23_labor_transaction.xlsx", sheet="labor_transaction"):
     issues = []
     for r in rows:
+        rate = _to_decimal(r.get("actual_rate"))
+        if rate is not None and rate <= 0:
+            issues.append(_issue(
+                "INVALID_LABOR_RATE", "ERROR", file, sheet, r.get("_source_row"),
+                f"actual_rate={rate} (임률 결측 또는 음수)", r.get("labor_doc_no")
+            ))
+
         try:
             regular = Decimal(str(r.get("regular_hours")))
             overtime = Decimal(str(r.get("overtime_hours")))
@@ -691,6 +698,16 @@ def validate_actual_cost(work_orders, production_outputs, labor_transactions,
         if wo_no is None:
             continue
         has_output_row.add(wo_no)
+
+        rework_qty = _to_decimal(po.get("rework_qty"))
+        if rework_qty is not None and rework_qty > 0:
+            issues.append(_issue(
+                "REWORK_REVIEW_REQUIRED", "REVIEW_REQUIRED", "21_production_output.xlsx",
+                "production_output", po.get("_source_row"),
+                f"WO={wo_no}: rework_qty={rework_qty} — 재작업 발생, 자동 판정하지 않음.",
+                wo_no
+            ))
+
         qty = _to_decimal(po.get("good_qty"))
         if qty is None:
             continue
@@ -948,5 +965,133 @@ def validate_gl_reconciliation(gl_transactions, account_mappings, work_orders,
                 f"집계에서 제외됩니다.",
                 wo.get("wo_no")
             ))
+
+    return issues
+
+def _period_for_date(company_code, date_str, periods):
+    """company_code + date_str(YYYY-MM-DD)가 실제로 속하는 period 행을 찾는다."""
+    if date_str is None:
+        return None
+    for p in periods:
+        if p.get("company_code") != company_code:
+            continue
+        start, end = p.get("start_date"), p.get("end_date")
+        if start is None or end is None:
+            continue
+        if str(start) <= str(date_str) <= str(end):
+            return p
+    return None
+
+def validate_gl_period(gl_transactions, periods,
+                       file="24_gl_transaction.xlsx", sheet="gl_transaction"):
+    """
+    GL 자체의 기간 관련 필드를 검증한다. 설계상 GL 귀속은 posting_date 기준이다.
+
+    - PERIOD_MISMATCH: 행에 적힌 period_key가 posting_date가 속한 실제 YYYY-MM과
+      다른 경우 (posting_date[:7] != period_key)
+    - PERIOD_CLOSED: posting_date가 실제로 속하는 period가 is_closed=Y인 경우.
+      행에 적힌 period_key 필드가 마감월을 가리킨다는 사실만으로는 판단하지 않는다
+      (그 필드 자체가 틀렸을 수 있으므로 — 그 경우는 PERIOD_MISMATCH가 이미 잡음).
+    """
+    issues = []
+    for r in gl_transactions:
+        posting_date = r.get("posting_date")
+        period_key = r.get("period_key")
+        company_code = r.get("company_code")
+        row = r.get("_source_row")
+        doc_no = r.get("document_no")
+
+        if posting_date is not None and period_key is not None:
+            if str(posting_date)[:7] != str(period_key):
+                issues.append(_issue(
+                    "PERIOD_MISMATCH", "ERROR", file, sheet, row,
+                    f"posting_date={posting_date}, period_key={period_key}",
+                    doc_no
+                ))
+
+        actual_period = _period_for_date(company_code, posting_date, periods)
+        if actual_period is not None and actual_period.get("is_closed") == "Y":
+            issues.append(_issue(
+                "PERIOD_CLOSED", "ERROR", file, sheet, row,
+                f"posting_date={posting_date}가 마감된 period "
+                f"{actual_period.get('period_key')}에 속합니다.",
+                doc_no
+            ))
+
+    return issues
+
+def validate_tolerance_rules(tolerance_rules, file="14_tolerance_rule.xlsx",
+                             sheet="tolerance_rule"):
+    """
+    14_tolerance_rule.xlsx에서 (company_code, rule_scope, material_code, product_code,
+    priority)가 동일한 규칙이 2개 이상 존재하면, 어느 것을 적용해야 할지 결정할
+    근거가 없다(validate_account_mapping의 MAPPING_AMBIGUOUS와 동일 원칙).
+    중복된 행마다 보고하지 않고 동일 조건 그룹당 1건만 보고한다.
+    """
+    issues = []
+    groups = defaultdict(list)
+    for r in tolerance_rules:
+        priority = _to_decimal(r.get("priority"))
+        key = (
+            r.get("company_code"), r.get("rule_scope"),
+            r.get("material_code"), r.get("product_code"), priority,
+        )
+        groups[key].append(r)
+
+    for key, rows_in_group in groups.items():
+        if len(rows_in_group) <= 1:
+            continue
+        company_code, rule_scope, material_code, product_code, priority = key
+        issues.append(_issue(
+            "TOLERANCE_AMBIGUOUS", "REVIEW_REQUIRED", file, sheet,
+            rows_in_group[0].get("_source_row"),
+            f"rule_scope={rule_scope}, material_code={material_code}, "
+            f"product_code={product_code}, priority={priority}: 동일 조건 규칙 "
+            f"{len(rows_in_group)}건이 중복됩니다.",
+            rule_scope
+        ))
+
+    return issues
+
+def _bom_date_ranges_overlap(start1, end1, start2, end2):
+    if start1 is None or end1 is None or start2 is None or end2 is None:
+        return False
+    return str(start1) <= str(end2) and str(start2) <= str(end1)
+
+def validate_bom_version(bom_versions, file="10_bom.xlsx", sheet="bom_version"):
+    """
+    같은 product_code에 대해 동시에 유효한(status=ACTIVE) BOM version이 2개 이상
+    존재하면 어느 버전이 표준인지 판단할 근거가 없다(design.md "동일 시점 ACTIVE
+    2건" 원칙). INACTIVE version은 이미 폐기된 버전이므로 판단에서 제외한다 —
+    effective 구간이 겹쳐도 한쪽이 ACTIVE, 다른 쪽이 INACTIVE면 모호하지 않다.
+    """
+    issues = []
+    active_by_product = defaultdict(list)
+    for v in bom_versions:
+        if v.get("status") != "ACTIVE":
+            continue
+        active_by_product[v.get("product_code")].append(v)
+
+    for product_code, versions in active_by_product.items():
+        reported_pairs = set()
+        for i in range(len(versions)):
+            for j in range(i + 1, len(versions)):
+                a, b = versions[i], versions[j]
+                if not _bom_date_ranges_overlap(
+                    a.get("effective_from"), a.get("effective_to"),
+                    b.get("effective_from"), b.get("effective_to"),
+                ):
+                    continue
+                pair_key = frozenset({a.get("bom_version_id"), b.get("bom_version_id")})
+                if pair_key in reported_pairs:
+                    continue
+                reported_pairs.add(pair_key)
+                issues.append(_issue(
+                    "BOM_VERSION_AMBIGUOUS", "REVIEW_REQUIRED", file, sheet,
+                    a.get("_source_row"),
+                    f"product_code={product_code}: {a.get('bom_version_id')}와 "
+                    f"{b.get('bom_version_id')}가 동시에 ACTIVE로 유효합니다.",
+                    product_code
+                ))
 
     return issues

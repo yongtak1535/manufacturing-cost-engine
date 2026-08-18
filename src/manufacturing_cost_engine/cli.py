@@ -8,7 +8,8 @@ from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
-    validate_bom_issues
+    validate_bom_issues, validate_gl_period, validate_tolerance_rules,
+    validate_bom_version
 )
 from .cost_engine import calculate_actual_total_cost_by_wo
 
@@ -42,6 +43,10 @@ def main():
         rows("22_material_issue.xlsx", "material_issue"),
         rows("08_material_master.xlsx", "material"),
     )
+
+    issues += validate_bom_version(rows("10_bom.xlsx", "bom_version"))
+
+    issues += validate_tolerance_rules(rows("14_tolerance_rule.xlsx", "tolerance_rule"))
 
     issues += validate_routing(
         rows("20_work_order.xlsx", "work_order"),
@@ -87,6 +92,10 @@ def main():
             labor_index[(wo, r.get("operation_seq"))] = routing_row
     issues += validate_labor(labor_rows, labor_index)
     issues += validate_gl_balance(rows("24_gl_transaction.xlsx", "gl_transaction"))
+    issues += validate_gl_period(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("02_period.xlsx", "period"),
+    )
     issues += validate_account_mapping(
         rows("24_gl_transaction.xlsx", "gl_transaction"),
         rows("05_account_mapping.xlsx", "account_mapping"),

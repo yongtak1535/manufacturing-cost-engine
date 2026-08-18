@@ -1,7 +1,9 @@
 from manufacturing_cost_engine.validation import (
     validate_period_rows, validate_gl_balance, validate_material_issues,
     validate_bom_issues, validate_routing, validate_account_mapping,
-    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation
+    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
+    validate_labor, validate_gl_period, validate_tolerance_rules,
+    validate_bom_version
 )
 
 def test_period_key_consistency():
@@ -722,8 +724,11 @@ def test_standard_cost_ga_not_required_for_completeness():
     assert not any(i.code == "STANDARD_COST_MISSING" for i in issues)
 
 
-def _po(wo_no="WO-1", good_qty="10", source_row=2):
-    return {"wo_no": wo_no, "good_qty": good_qty, "_source_row": source_row}
+def _po(wo_no="WO-1", good_qty="10", source_row=2, rework_qty="0"):
+    return {
+        "wo_no": wo_no, "good_qty": good_qty, "rework_qty": rework_qty,
+        "_source_row": source_row,
+    }
 
 def _labor_tx(wo_no="WO-1", direct_indirect="DIRECT", work_center_code="WC-20"):
     return {
@@ -1023,4 +1028,238 @@ def test_gl_recon_ignores_unmapped_gl_account():
         [_product()],
         [_period()],
     )
+    assert issues == []
+
+
+# --- P1: INVALID_LABOR_RATE (validate_labor) ---
+
+def _labor_transaction(wo_no="WO-1", operation_seq=20, operation_code="OP-TRN",
+                        regular_hours="1", overtime_hours="0", actual_hours="1",
+                        actual_rate="24000", source_row=2):
+    return {
+        "wo_no": wo_no, "operation_seq": operation_seq, "operation_code": operation_code,
+        "regular_hours": regular_hours, "overtime_hours": overtime_hours,
+        "actual_hours": actual_hours, "actual_rate": actual_rate,
+        "labor_doc_no": "LB-1", "_source_row": source_row,
+    }
+
+def test_labor_normal_rate_no_issue():
+    row = _labor_transaction(actual_rate="24000")
+    routing_index = {("WO-1", 20): {"operation_code": "OP-TRN"}}
+    issues = validate_labor([row], routing_index)
+    assert not any(i.code == "INVALID_LABOR_RATE" for i in issues)
+
+def test_labor_zero_rate_detected():
+    # 실제 LB-2607-039(actual_rate=0)와 동일한 케이스 — 임률 결측으로 판정.
+    row = _labor_transaction(actual_rate="0")
+    routing_index = {("WO-1", 20): {"operation_code": "OP-TRN"}}
+    issues = validate_labor([row], routing_index)
+    rate_issues = [i for i in issues if i.code == "INVALID_LABOR_RATE"]
+    assert len(rate_issues) == 1
+    assert rate_issues[0].severity == "ERROR"
+
+def test_labor_negative_rate_detected():
+    row = _labor_transaction(actual_rate="-100")
+    routing_index = {("WO-1", 20): {"operation_code": "OP-TRN"}}
+    issues = validate_labor([row], routing_index)
+    assert any(i.code == "INVALID_LABOR_RATE" for i in issues)
+
+def test_labor_rate_boundary_positive_no_issue():
+    # 경계값: 0.01처럼 아주 작아도 양수면 오류가 아니다.
+    row = _labor_transaction(actual_rate="0.01")
+    routing_index = {("WO-1", 20): {"operation_code": "OP-TRN"}}
+    issues = validate_labor([row], routing_index)
+    assert not any(i.code == "INVALID_LABOR_RATE" for i in issues)
+
+def test_labor_existing_checks_still_work_alongside_rate_check():
+    # 회귀: 기존 NEGATIVE_OVERTIME/UNKNOWN_ROUTING_OPERATION 동작이 그대로 유지되는지.
+    row = _labor_transaction(
+        overtime_hours="-1", actual_hours="0", operation_seq=99, actual_rate="24000"
+    )
+    issues = validate_labor([row], {})
+    codes = {i.code for i in issues}
+    assert "NEGATIVE_OVERTIME" in codes
+    assert "UNKNOWN_ROUTING_OPERATION" in codes
+    assert "INVALID_LABOR_RATE" not in codes
+
+
+# --- P1: REWORK_REVIEW_REQUIRED (validate_actual_cost) ---
+
+def test_actual_cost_no_rework_no_issue():
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")],
+        [_po(wo_no="WO-1", good_qty="10", rework_qty="0")],
+        [],
+        [],
+        [],
+    )
+    assert not any(i.code == "REWORK_REVIEW_REQUIRED" for i in issues)
+
+def test_actual_cost_rework_detected():
+    # 실제 WO-2607-005(rework_qty=4)와 동일한 케이스.
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")],
+        [_po(wo_no="WO-1", good_qty="12", rework_qty="4")],
+        [],
+        [],
+        [],
+    )
+    rework_issues = [i for i in issues if i.code == "REWORK_REVIEW_REQUIRED"]
+    assert len(rework_issues) == 1
+    assert rework_issues[0].severity == "REVIEW_REQUIRED"
+
+def test_actual_cost_rework_zero_boundary_no_issue():
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")],
+        [_po(wo_no="WO-1", good_qty="10", rework_qty="0")],
+        [],
+        [],
+        [],
+    )
+    assert not any(i.code == "REWORK_REVIEW_REQUIRED" for i in issues)
+
+
+# --- P1: PERIOD_MISMATCH / PERIOD_CLOSED (validate_gl_period) ---
+
+def test_gl_period_matching_posting_date_no_issue():
+    issues = validate_gl_period(
+        [_gl_line(period_key="2026-07")],
+        [_period(period_key="2026-07", end_date="2026-07-31")],
+    )
+    assert issues == []
+
+def test_gl_period_mismatch_detected():
+    # 실제 GL-260731-020 line2(period_key=2026-07, posting_date=2026-08-01)와 동일.
+    row = _gl_line(period_key="2026-07")
+    row["posting_date"] = "2026-08-01"
+    issues = validate_gl_period([row], [_period(period_key="2026-07")])
+    mismatch = [i for i in issues if i.code == "PERIOD_MISMATCH"]
+    assert len(mismatch) == 1
+    assert mismatch[0].severity == "ERROR"
+
+def test_gl_period_closed_detected_by_posting_date():
+    # posting_date가 실제로 마감된 period의 날짜 범위 안에 있으면 PERIOD_CLOSED.
+    row = _gl_line(period_key="2026-06")
+    row["posting_date"] = "2026-06-15"
+    periods = [_period(period_key="2026-06", end_date="2026-06-30")]
+    periods[0]["is_closed"] = "Y"
+    periods[0]["start_date"] = "2026-06-01"
+    issues = validate_gl_period([row], periods)
+    assert any(i.code == "PERIOD_CLOSED" for i in issues)
+
+def test_gl_period_key_pointing_to_closed_month_alone_does_not_trigger():
+    # 실제 GL-260731-021 line2와 동일 구조: period_key 필드만 마감월(2026-06)이고
+    # posting_date는 실제로 열린 기간(7월)이다. period_key 필드만으로는 PERIOD_CLOSED를
+    # 만들지 않는다 (posting_date 기준으로만 판단).
+    row = _gl_line(period_key="2026-06")
+    row["posting_date"] = "2026-07-31"
+    periods = [
+        {"company_code": "HB01", "period_key": "2026-06", "start_date": "2026-06-01",
+         "end_date": "2026-06-30", "is_closed": "Y"},
+        {"company_code": "HB01", "period_key": "2026-07", "start_date": "2026-07-01",
+         "end_date": "2026-07-31", "is_closed": "N"},
+    ]
+    issues = validate_gl_period([row], periods)
+    assert not any(i.code == "PERIOD_CLOSED" for i in issues)
+    # 대신 period_key(06)와 실제 posting_date(07)가 다르므로 PERIOD_MISMATCH는 발생한다.
+    assert any(i.code == "PERIOD_MISMATCH" for i in issues)
+
+def test_gl_period_no_closed_postings_in_real_dataset_shape():
+    # 실제 데이터처럼 posting_date가 마감 기간 범위 밖이면 PERIOD_CLOSED는 0건이어야 한다.
+    row = _gl_line(period_key="2026-07")
+    row["posting_date"] = "2026-07-31"
+    periods = [
+        {"company_code": "HB01", "period_key": "2026-06", "start_date": "2026-06-01",
+         "end_date": "2026-06-30", "is_closed": "Y"},
+        {"company_code": "HB01", "period_key": "2026-07", "start_date": "2026-07-01",
+         "end_date": "2026-07-31", "is_closed": "N"},
+    ]
+    issues = validate_gl_period([row], periods)
+    assert issues == []
+
+
+# --- P1: TOLERANCE_AMBIGUOUS (validate_tolerance_rules) ---
+
+def _tolerance_rule(company_code="HB01", rule_scope="BOM_ISSUE", material_code=None,
+                     product_code=None, priority=10, source_row=2):
+    return {
+        "company_code": company_code, "rule_scope": rule_scope,
+        "material_code": material_code, "product_code": product_code,
+        "priority": priority, "_source_row": source_row,
+    }
+
+def test_tolerance_rules_no_duplicate_no_issue():
+    issues = validate_tolerance_rules([
+        _tolerance_rule(rule_scope="BOM_ISSUE", priority=10, source_row=2),
+        _tolerance_rule(rule_scope="BOM_ISSUE", material_code="MAT-003", priority=20,
+                         source_row=3),
+    ])
+    assert issues == []
+
+def test_tolerance_rules_duplicate_reported_once():
+    # 실제 14_tolerance_rule.xlsx의 0번/5번 행과 동일한 완전 중복 케이스.
+    issues = validate_tolerance_rules([
+        _tolerance_rule(rule_scope="BOM_ISSUE", priority=10, source_row=2),
+        _tolerance_rule(rule_scope="LABOR_HOURS", priority=10, source_row=3),
+        _tolerance_rule(rule_scope="BOM_ISSUE", priority=10, source_row=6),
+    ])
+    ambiguous = [i for i in issues if i.code == "TOLERANCE_AMBIGUOUS"]
+    assert len(ambiguous) == 1
+    assert ambiguous[0].severity == "REVIEW_REQUIRED"
+
+def test_tolerance_rules_different_priority_not_ambiguous():
+    issues = validate_tolerance_rules([
+        _tolerance_rule(rule_scope="BOM_ISSUE", priority=10),
+        _tolerance_rule(rule_scope="BOM_ISSUE", priority=20),
+    ])
+    assert issues == []
+
+
+# --- P1: BOM_VERSION_AMBIGUOUS (validate_bom_version) ---
+
+def _bom_version(bom_version_id="BOM-P100-A", product_code="P-100", status="ACTIVE",
+                  effective_from="2026-01-01", effective_to="2099-12-31", source_row=2):
+    return {
+        "bom_version_id": bom_version_id, "product_code": product_code,
+        "status": status, "effective_from": effective_from,
+        "effective_to": effective_to, "_source_row": source_row,
+    }
+
+def test_bom_version_single_active_no_issue():
+    issues = validate_bom_version([_bom_version()])
+    assert issues == []
+
+def test_bom_version_two_active_overlapping_detected():
+    issues = validate_bom_version([
+        _bom_version(bom_version_id="BOM-X-A", product_code="P-X",
+                     effective_from="2026-01-01", effective_to="2026-06-30",
+                     source_row=2),
+        _bom_version(bom_version_id="BOM-X-B", product_code="P-X",
+                     effective_from="2026-06-01", effective_to="2099-12-31",
+                     source_row=3),
+    ])
+    ambiguous = [i for i in issues if i.code == "BOM_VERSION_AMBIGUOUS"]
+    assert len(ambiguous) == 1
+    assert ambiguous[0].severity == "REVIEW_REQUIRED"
+
+def test_bom_version_inactive_and_active_overlap_not_ambiguous():
+    # 실제 P-400(BOM-P400-A=INACTIVE, BOM-P400-B=ACTIVE)과 동일한 구조.
+    # 날짜는 겹치지만 하나가 INACTIVE이므로 모호하지 않다.
+    issues = validate_bom_version([
+        _bom_version(bom_version_id="BOM-P400-A", product_code="P-400",
+                     status="INACTIVE", effective_from="2026-01-01",
+                     effective_to="2026-06-30"),
+        _bom_version(bom_version_id="BOM-P400-B", product_code="P-400",
+                     status="ACTIVE", effective_from="2026-06-01",
+                     effective_to="2099-12-31"),
+    ])
+    assert issues == []
+
+def test_bom_version_non_overlapping_active_versions_not_ambiguous():
+    issues = validate_bom_version([
+        _bom_version(bom_version_id="BOM-Y-A", product_code="P-Y",
+                     effective_from="2026-01-01", effective_to="2026-03-31"),
+        _bom_version(bom_version_id="BOM-Y-B", product_code="P-Y",
+                     effective_from="2026-04-01", effective_to="2099-12-31"),
+    ])
     assert issues == []
