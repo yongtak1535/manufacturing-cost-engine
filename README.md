@@ -1,2 +1,0 @@
-# manufacturing-cost-engine
-Cost
