@@ -175,3 +175,118 @@ def validate_gl_balance(rows, file="24_gl_transaction.xlsx", sheet="gl_transacti
                 f"{doc}: debit={debit}, credit={credit}", doc
             ))
     return issues
+
+# BOM_ISSUE tolerance: max(abs_tolerance, abs(expected_qty) * pct_tolerance).
+DEFAULT_BOM_TOLERANCE = {"abs": Decimal("0.01"), "pct": Decimal("0.02")}
+BOM_TOLERANCE_OVERRIDES = {
+    "MAT-003": {"abs": Decimal("0.05"), "pct": Decimal("0.01")},
+}
+
+def _to_decimal(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return None
+
+def _bom_tolerance(material_code, expected_qty):
+    cfg = BOM_TOLERANCE_OVERRIDES.get(material_code, DEFAULT_BOM_TOLERANCE)
+    return max(cfg["abs"], abs(expected_qty) * cfg["pct"])
+
+def _index_bom_items(bom_items):
+    """bom_version_id -> material_code -> {"qty": Decimal, "uom": str}"""
+    index = defaultdict(dict)
+    for item in bom_items:
+        bom_version_id = item.get("bom_version_id")
+        material_code = item.get("material_code")
+        if bom_version_id is None or material_code is None:
+            continue
+        qty = _to_decimal(item.get("standard_qty"))
+        if qty is None:
+            continue
+        entry = index[bom_version_id].setdefault(
+            material_code, {"qty": Decimal("0"), "uom": item.get("uom")}
+        )
+        entry["qty"] += qty
+        entry["uom"] = item.get("uom")
+    return index
+
+def _index_material_issues(material_issues):
+    """wo_no -> material_code -> {"qty": Decimal, "uoms": set, "last_row": int|None}"""
+    index = defaultdict(dict)
+    for r in material_issues:
+        wo_no = r.get("wo_no")
+        material_code = r.get("material_code")
+        if wo_no is None or material_code is None:
+            continue
+        qty = _to_decimal(r.get("issued_qty"))
+        if qty is None:
+            continue
+        signed_qty = -qty if r.get("issue_type") == "RETURN" else qty
+        entry = index[wo_no].setdefault(
+            material_code, {"qty": Decimal("0"), "uoms": set(), "last_row": None}
+        )
+        entry["qty"] += signed_qty
+        uom = r.get("uom")
+        if uom is not None:
+            entry["uoms"].add(uom)
+        entry["last_row"] = r.get("_source_row")
+    return index
+
+def validate_bom_issues(work_orders, bom_items, material_issues, materials,
+                        file="22_material_issue.xlsx", sheet="material_issue"):
+    """
+    WO의 bom_version_id 기준 BOM 표준투입량과 material_issue 순출고량(ISSUE-RETURN)을
+    비교해 tolerance를 벗어나면 BOM_ISSUE를 생성한다.
+    BOM 미등재 자재(expected=0)와 미출고 자재(actual=0)도 동일 경로로 판정한다.
+    """
+    issues = []
+    bom_index = _index_bom_items(bom_items)
+    issue_index = _index_material_issues(material_issues)
+    material_uom = {
+        m.get("material_code"): m.get("base_uom")
+        for m in materials if m.get("material_code")
+    }
+
+    for wo in work_orders:
+        wo_no = wo.get("wo_no")
+        planned_qty = _to_decimal(wo.get("planned_qty"))
+        if wo_no is None or planned_qty is None:
+            continue
+
+        bom_materials = bom_index.get(wo.get("bom_version_id"), {})
+        issued_materials = issue_index.get(wo_no, {})
+
+        for material_code in set(bom_materials) | set(issued_materials):
+            bom_entry = bom_materials.get(material_code)
+            issue_entry = issued_materials.get(material_code)
+
+            bom_uom = bom_entry["uom"] if bom_entry else None
+            issue_uoms = issue_entry["uoms"] if issue_entry else set()
+            source_row = issue_entry["last_row"] if issue_entry else None
+
+            if bom_uom is not None and issue_uoms and issue_uoms != {bom_uom}:
+                base_uom = material_uom.get(material_code)
+                issues.append(_issue(
+                    "UOM_CONVERSION_MISSING", "REVIEW_REQUIRED", file, sheet,
+                    source_row,
+                    f"WO={wo_no}, material={material_code}: BOM UOM={bom_uom}, "
+                    f"Issue UOM={','.join(sorted(issue_uoms))}, "
+                    f"base_uom={base_uom} 기준 환산 불가",
+                    material_code
+                ))
+                continue
+
+            expected_qty = (bom_entry["qty"] * planned_qty) if bom_entry else Decimal("0")
+            actual_qty = issue_entry["qty"] if issue_entry else Decimal("0")
+            difference = actual_qty - expected_qty
+            tolerance = _bom_tolerance(material_code, expected_qty)
+
+            if abs(difference) > tolerance:
+                issues.append(_issue(
+                    "BOM_ISSUE", "ERROR", file, sheet, source_row,
+                    f"WO={wo_no}, material={material_code}: expected={expected_qty}, "
+                    f"actual={actual_qty}, diff={difference}, tolerance={tolerance}",
+                    material_code
+                ))
+
+    return issues

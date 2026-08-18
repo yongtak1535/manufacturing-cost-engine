@@ -10,6 +10,7 @@ CRITICAL = {
 }
 
 ERROR = {
+    "BOM_ISSUE",
     "BOM_OVER_ISSUE",
     "BOM_UNDER_ISSUE",
     "HOURS_SUM_MISMATCH",
