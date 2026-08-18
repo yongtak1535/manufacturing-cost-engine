@@ -517,3 +517,150 @@ def validate_account_mapping(gl_transactions, account_mappings,
             ))
 
     return issues
+
+# 14_tolerance_rule.xlsx AMOUNT_CHECK(abs_tolerance=0.01)와 동일한 허용오차를 재사용한다.
+STANDARD_COST_AMOUNT_TOLERANCE = Decimal("0.01")
+
+def _sum_standard_cost_detail(standard_cost_detail):
+    """(company,product,period,element,version) -> Σ detail.standard_amount"""
+    sums = {}
+    for d in standard_cost_detail:
+        key = (
+            d.get("company_code"), d.get("product_code"), d.get("period_key"),
+            d.get("cost_element_code"), d.get("version"),
+        )
+        if any(v is None for v in key):
+            continue
+        amount = _to_decimal(d.get("standard_amount"))
+        if amount is None:
+            continue
+        sums[key] = sums.get(key, Decimal("0")) + amount
+    return sums
+
+def validate_standard_cost(standard_cost_header, standard_cost_detail, products,
+                           cost_elements, materials):
+    """
+    12_standard_cost.xlsx(이미 확정된 표준원가 마스터)의 정합성만 검증한다.
+    새 표준원가를 BOM/Routing으로부터 재계산하지 않는다 — standard_cost_detail이
+    없는 제품(P-100/300/400)에 대해 BOM×material 단가로 역산한 값과 header가 달라도,
+    그 차이를 검증 대상으로 삼을 근거(공식 detail)가 없으므로 다루지 않는다.
+
+    - Header 자연키 중복은 기존 duplicate_keys() 재사용
+    - Header 자체 검산(qty×price≈amount)은 기존 AMOUNT_MISMATCH 재사용
+    - product/material FK 위반은 기존 UNKNOWN_PRODUCT/UNKNOWN_MATERIAL 재사용
+    - Detail↔Header 합계는 detail이 실제 존재하는 조합에서만 검증(없으면 스킵)
+    - GA(is_manufacturing=N)는 completeness 판정을 product 단위로만 하므로
+      GA 행 부재를 별도로 오류 처리하지 않는다(현재 12_standard_cost.xlsx엔 GA 자체가 없음)
+    """
+    issues = []
+
+    header_file, header_sheet = "12_standard_cost.xlsx", "standard_cost"
+    detail_file, detail_sheet = "12_standard_cost.xlsx", "standard_cost_detail"
+
+    product_codes = {p.get("product_code") for p in products}
+    active_product_codes = {
+        p.get("product_code") for p in products if p.get("is_active") == "Y"
+    }
+    cost_element_codes = {c.get("cost_element_code") for c in cost_elements}
+    material_codes = {m.get("material_code") for m in materials}
+
+    # A. Header 자연키 중복 (기존 헬퍼 재사용)
+    issues += duplicate_keys(
+        standard_cost_header,
+        ["company_code", "product_code", "period_key", "cost_element_code", "version"],
+        header_file, header_sheet,
+    )
+
+    # B. Header 자체 검산 + C. Header FK
+    for h in standard_cost_header:
+        row = h.get("_source_row")
+        product_code = h.get("product_code")
+        cost_element_code = h.get("cost_element_code")
+
+        if product_code not in product_codes:
+            issues.append(_issue(
+                "UNKNOWN_PRODUCT", "CRITICAL", header_file, header_sheet, row,
+                f"등록되지 않은 제품: {product_code}", product_code
+            ))
+
+        if cost_element_code not in cost_element_codes:
+            issues.append(_issue(
+                "UNKNOWN_COST_ELEMENT", "CRITICAL", header_file, header_sheet, row,
+                f"등록되지 않은 cost_element: {cost_element_code}", cost_element_code
+            ))
+
+        qty = _to_decimal(h.get("standard_qty"))
+        price = _to_decimal(h.get("standard_unit_price"))
+        amount = _to_decimal(h.get("standard_amount"))
+        if qty is None or price is None or amount is None:
+            continue
+        expected = qty * price
+        if abs(amount - expected) > STANDARD_COST_AMOUNT_TOLERANCE:
+            issues.append(_issue(
+                "AMOUNT_MISMATCH", "ERROR", header_file, header_sheet, row,
+                f"standard_amount={amount}, expected={expected} "
+                f"(standard_qty={qty} x standard_unit_price={price})",
+                product_code
+            ))
+
+    # D. Detail FK
+    for d in standard_cost_detail:
+        row = d.get("_source_row")
+        product_code = d.get("product_code")
+        cost_element_code = d.get("cost_element_code")
+        ref_material_code = d.get("ref_material_code")
+
+        if product_code not in product_codes:
+            issues.append(_issue(
+                "UNKNOWN_PRODUCT", "CRITICAL", detail_file, detail_sheet, row,
+                f"등록되지 않은 제품: {product_code}", product_code
+            ))
+
+        if cost_element_code not in cost_element_codes:
+            issues.append(_issue(
+                "UNKNOWN_COST_ELEMENT", "CRITICAL", detail_file, detail_sheet, row,
+                f"등록되지 않은 cost_element: {cost_element_code}", cost_element_code
+            ))
+
+        if ref_material_code is not None and ref_material_code not in material_codes:
+            issues.append(_issue(
+                "UNKNOWN_MATERIAL", "CRITICAL", detail_file, detail_sheet, row,
+                f"등록되지 않은 자재: {ref_material_code}", ref_material_code
+            ))
+
+    # E. Detail -> Header 합계 (detail이 실제로 존재하는 조합만 검증)
+    detail_sums = _sum_standard_cost_detail(standard_cost_detail)
+    for h in standard_cost_header:
+        key = (
+            h.get("company_code"), h.get("product_code"), h.get("period_key"),
+            h.get("cost_element_code"), h.get("version"),
+        )
+        if key not in detail_sums:
+            continue
+        header_amount = _to_decimal(h.get("standard_amount"))
+        if header_amount is None:
+            continue
+        detail_sum = detail_sums[key]
+        if abs(detail_sum - header_amount) > STANDARD_COST_AMOUNT_TOLERANCE:
+            issues.append(_issue(
+                "STD_DETAIL_SUM_MISMATCH", "ERROR", detail_file, detail_sheet,
+                h.get("_source_row"),
+                f"product={h.get('product_code')}, element={h.get('cost_element_code')}: "
+                f"detail_sum={detail_sum}, header={header_amount}",
+                h.get("product_code")
+            ))
+
+    # F. Standard Cost 완전성: active product인데 header가 아예 없는 제품
+    products_with_header = {h.get("product_code") for h in standard_cost_header}
+    for product_code in active_product_codes - products_with_header:
+        product_row = next(
+            (p for p in products if p.get("product_code") == product_code), None
+        )
+        issues.append(_issue(
+            "STANDARD_COST_MISSING", "ERROR", "07_product_master.xlsx", "product",
+            product_row.get("_source_row") if product_row else None,
+            f"product_code={product_code}에 대한 standard_cost가 없습니다.",
+            product_code
+        ))
+
+    return issues

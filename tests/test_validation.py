@@ -1,6 +1,7 @@
 from manufacturing_cost_engine.validation import (
     validate_period_rows, validate_gl_balance, validate_material_issues,
-    validate_bom_issues, validate_routing, validate_account_mapping
+    validate_bom_issues, validate_routing, validate_account_mapping,
+    validate_standard_cost
 )
 
 def test_period_key_consistency():
@@ -496,3 +497,179 @@ def test_account_mapping_excludes_lines_with_both_debit_and_credit():
         [],
     )
     assert issues == []
+
+
+def _product(product_code="P-100", base_uom="EA", is_active="Y"):
+    return {
+        "company_code": "HB01", "product_code": product_code,
+        "product_name": "테스트제품", "base_uom": base_uom,
+        "product_group": "TEST", "is_active": is_active,
+    }
+
+def _cost_element(cost_element_code="DM", is_manufacturing="Y"):
+    return {
+        "cost_element_code": cost_element_code, "cost_element_name": "테스트",
+        "is_manufacturing": is_manufacturing,
+    }
+
+def _std_cost_header(company_code="HB01", product_code="P-100", period_key="2026-07",
+                      cost_element_code="DM", standard_qty="1",
+                      standard_unit_price="1000", standard_amount="1000",
+                      version="V1", source_row=2):
+    return {
+        "company_code": company_code, "product_code": product_code,
+        "period_key": period_key, "cost_element_code": cost_element_code,
+        "standard_qty": standard_qty, "standard_unit_price": standard_unit_price,
+        "standard_amount": standard_amount, "version": version,
+        "_source_row": source_row,
+    }
+
+def _std_cost_detail(company_code="HB01", product_code="P-100", period_key="2026-07",
+                      cost_element_code="DM", ref_type="MATERIAL",
+                      ref_material_code="MAT-001", routing_version_id=None,
+                      ref_operation_seq=None, standard_qty="1",
+                      standard_unit_price="1000", standard_amount="1000",
+                      version="V1", source_row=2):
+    return {
+        "company_code": company_code, "product_code": product_code,
+        "period_key": period_key, "cost_element_code": cost_element_code,
+        "ref_type": ref_type, "ref_material_code": ref_material_code,
+        "routing_version_id": routing_version_id,
+        "ref_operation_seq": ref_operation_seq, "standard_qty": standard_qty,
+        "standard_unit_price": standard_unit_price,
+        "standard_amount": standard_amount, "version": version,
+        "_source_row": source_row,
+    }
+
+def test_standard_cost_normal_header_no_issue():
+    issues = validate_standard_cost(
+        [_std_cost_header(standard_qty="1", standard_unit_price="1000",
+                           standard_amount="1000")],
+        [],
+        [_product()],
+        [_cost_element("DM")],
+        [],
+    )
+    assert issues == []
+
+def test_standard_cost_header_amount_mismatch():
+    issues = validate_standard_cost(
+        [_std_cost_header(standard_qty="1", standard_unit_price="1000",
+                           standard_amount="1500")],
+        [],
+        [_product()],
+        [_cost_element("DM")],
+        [],
+    )
+    assert any(i.code == "AMOUNT_MISMATCH" for i in issues)
+
+def test_standard_cost_header_natural_key_duplicate():
+    issues = validate_standard_cost(
+        [_std_cost_header(source_row=2), _std_cost_header(source_row=3)],
+        [],
+        [_product()],
+        [_cost_element("DM")],
+        [],
+    )
+    assert any(i.code == "DUPLICATE_NATURAL_KEY" for i in issues)
+
+def test_standard_cost_unknown_product():
+    issues = validate_standard_cost(
+        [_std_cost_header(product_code="P-999")],
+        [],
+        [_product("P-100")],
+        [_cost_element("DM")],
+        [],
+    )
+    assert any(i.code == "UNKNOWN_PRODUCT" for i in issues)
+
+def test_standard_cost_unknown_cost_element():
+    issues = validate_standard_cost(
+        [_std_cost_header(cost_element_code="XX")],
+        [],
+        [_product()],
+        [_cost_element("DM")],
+        [],
+    )
+    assert any(i.code == "UNKNOWN_COST_ELEMENT" for i in issues)
+
+def test_standard_cost_detail_header_sum_matches():
+    issues = validate_standard_cost(
+        [_std_cost_header(standard_amount="1000")],
+        [
+            _std_cost_detail(standard_amount="600", source_row=2),
+            _std_cost_detail(standard_amount="400", source_row=3),
+        ],
+        [_product()],
+        [_cost_element("DM")],
+        [_material("MAT-001")],
+    )
+    assert issues == []
+
+def test_standard_cost_detail_header_sum_mismatch():
+    issues = validate_standard_cost(
+        [_std_cost_header(standard_amount="1000")],
+        [_std_cost_detail(standard_amount="600")],
+        [_product()],
+        [_cost_element("DM")],
+        [_material("MAT-001")],
+    )
+    assert any(i.code == "STD_DETAIL_SUM_MISMATCH" for i in issues)
+
+def test_standard_cost_no_detail_skips_sum_check():
+    # 실제 P-100/300/400처럼 detail이 전혀 없는 조합은 합계 검증 자체를 건너뛴다.
+    issues = validate_standard_cost(
+        [_std_cost_header(product_code="P-300", standard_amount="9999")],
+        [],
+        [_product("P-300")],
+        [_cost_element("DM")],
+        [],
+    )
+    assert not any(i.code == "STD_DETAIL_SUM_MISMATCH" for i in issues)
+
+def test_standard_cost_missing_for_active_product():
+    # 실제 P-900처럼: product master엔 있지만 standard_cost header가 전혀 없는 경우.
+    issues = validate_standard_cost(
+        [_std_cost_header(product_code="P-100")],
+        [],
+        [_product("P-100"), _product("P-900")],
+        [_cost_element("DM")],
+        [],
+    )
+    missing = [i for i in issues if i.code == "STANDARD_COST_MISSING"]
+    assert len(missing) == 1
+    assert missing[0].related_entity == "P-900"
+
+def test_standard_cost_detail_unknown_material():
+    issues = validate_standard_cost(
+        [],
+        [_std_cost_detail(ref_material_code="MAT-999")],
+        [_product()],
+        [_cost_element("DM")],
+        [_material("MAT-001")],
+    )
+    assert any(i.code == "UNKNOWN_MATERIAL" for i in issues)
+
+def test_standard_cost_decimal_boundary_within_tolerance():
+    # diff가 정확히 0.01(허용오차)이면 초과가 아니므로 오류가 아니다(경계 포함).
+    issues = validate_standard_cost(
+        [_std_cost_header(standard_qty="1", standard_unit_price="1000",
+                           standard_amount="1000.01")],
+        [],
+        [_product()],
+        [_cost_element("DM")],
+        [],
+    )
+    assert issues == []
+
+def test_standard_cost_ga_not_required_for_completeness():
+    # GA(is_manufacturing=N)는 completeness 판정에서 요구되지 않는다.
+    # product가 DM 행 하나만 있어도 STANDARD_COST_MISSING이 아니다.
+    issues = validate_standard_cost(
+        [_std_cost_header(product_code="P-100", cost_element_code="DM")],
+        [],
+        [_product("P-100")],
+        [_cost_element("DM"), _cost_element("GA", is_manufacturing="N")],
+        [],
+    )
+    assert not any(i.code == "STANDARD_COST_MISSING" for i in issues)

@@ -6,7 +6,8 @@ from collections import Counter
 from .loader import load_dataset
 from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
-    validate_labor, validate_gl_balance, validate_routing, validate_account_mapping
+    validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
+    validate_standard_cost
 )
 
 def main():
@@ -80,6 +81,13 @@ def main():
     issues += validate_account_mapping(
         rows("24_gl_transaction.xlsx", "gl_transaction"),
         rows("05_account_mapping.xlsx", "account_mapping"),
+    )
+    issues += validate_standard_cost(
+        rows("12_standard_cost.xlsx", "standard_cost"),
+        rows("12_standard_cost.xlsx", "standard_cost_detail"),
+        products,
+        rows("04_cost_element.xlsx", "cost_element"),
+        rows("08_material_master.xlsx", "material"),
     )
 
     print(f"Loaded sheets: {len(data)}")
