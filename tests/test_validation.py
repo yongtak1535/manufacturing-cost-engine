@@ -3,7 +3,7 @@ from manufacturing_cost_engine.validation import (
     validate_bom_issues, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_labor, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version
+    validate_bom_version, validate_labor_hours
 )
 
 def test_period_key_consistency():
@@ -1263,3 +1263,102 @@ def test_bom_version_non_overlapping_active_versions_not_ambiguous():
                      effective_from="2026-04-01", effective_to="2099-12-31"),
     ])
     assert issues == []
+
+
+# --- EXCESSIVE_LABOR_HOURS (validate_labor_hours) ---
+
+def test_labor_hours_normal_within_tolerance_no_issue():
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [_labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="1")],
+        [_po(wo_no="WO-1", good_qty="14")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    assert not any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+def test_labor_hours_excessive_detected_wo_2607_001_shape():
+    # 실제 WO-2607-001(P-100, seq20, good_qty=12, standard=0.45)과 동일한 구조.
+    # 표준총공수=5.4, threshold=5.67, 실제 합계=23.5 -> 초과.
+    labor_rows = [
+        _labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="10", source_row=2),
+        _labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="13.5", source_row=3),
+    ]
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        labor_rows,
+        [_po(wo_no="WO-1", good_qty="12")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    excessive = [i for i in issues if i.code == "EXCESSIVE_LABOR_HOURS"]
+    assert len(excessive) == 1
+    assert excessive[0].severity == "WARNING"
+    assert excessive[0].related_entity == "WO-1"
+
+def test_labor_hours_zero_good_qty_excluded():
+    # 실제 WO-2607-009(good_qty=0)와 동일한 케이스 — 분모 0이라 계산에서 제외한다.
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [_labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="1")],
+        [_po(wo_no="WO-1", good_qty="0")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    assert not any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+def test_labor_hours_exact_five_percent_boundary_not_excessive():
+    # standard_total=4.5, threshold=4.5*1.05=4.725. 정확히 경계값이면 초과가 아니다.
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [_labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="4.725")],
+        [_po(wo_no="WO-1", good_qty="10")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    assert not any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+def test_labor_hours_just_over_five_percent_boundary_excessive():
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [_labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="4.73")],
+        [_po(wo_no="WO-1", good_qty="10")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    assert any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+def test_labor_hours_unknown_routing_operation_excluded():
+    # 실제 operation_seq=99(routing 미등재)와 동일한 케이스 — UNKNOWN_ROUTING_OPERATION이
+    # 이미 담당하는 문제이므로 EXCESSIVE_LABOR_HOURS 계산에서는 제외한다.
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [_labor_transaction(wo_no="WO-1", operation_seq=99, actual_hours="100")],
+        [_po(wo_no="WO-1", good_qty="12")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="0.45")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    assert not any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+def test_labor_hours_sums_multiple_transactions():
+    issues = validate_labor_hours(
+        [_wo(wo_no="WO-1", product_code="P-100")],
+        [
+            _labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="0.5",
+                               source_row=2),
+            _labor_transaction(wo_no="WO-1", operation_seq=20, actual_hours="0.6",
+                               source_row=3),
+        ],
+        [_po(wo_no="WO-1", good_qty="1")],
+        [_routing_operation(routing_version_id="RTG-P100-A", operation_seq=20,
+                            standard_hours="1")],
+        [_routing_version(routing_version_id="RTG-P100-A", product_code="P-100")],
+    )
+    # standard=1, threshold=1.05, 합계=1.1 -> 초과
+    assert any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)

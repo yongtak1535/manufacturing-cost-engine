@@ -9,7 +9,7 @@ from .validation import (
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version
+    validate_bom_version, validate_labor_hours
 )
 from .cost_engine import calculate_actual_total_cost_by_wo
 
@@ -91,6 +91,13 @@ def main():
         if routing_row is not None:
             labor_index[(wo, r.get("operation_seq"))] = routing_row
     issues += validate_labor(labor_rows, labor_index)
+    issues += validate_labor_hours(
+        rows("20_work_order.xlsx", "work_order"),
+        labor_rows,
+        rows("21_production_output.xlsx", "production_output"),
+        rows("11_routing.xlsx", "routing_operation"),
+        rows("11_routing.xlsx", "routing_version"),
+    )
     issues += validate_gl_balance(rows("24_gl_transaction.xlsx", "gl_transaction"))
     issues += validate_gl_period(
         rows("24_gl_transaction.xlsx", "gl_transaction"),

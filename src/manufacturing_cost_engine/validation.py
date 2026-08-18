@@ -1095,3 +1095,98 @@ def validate_bom_version(bom_versions, file="10_bom.xlsx", sheet="bom_version"):
                 ))
 
     return issues
+
+# 14_tolerance_rule.xlsx LABOR_HOURS: abs=0, pct=0.05, apply_rule=PCT_ONLY.
+LABOR_HOURS_PCT_TOLERANCE = Decimal("0.05")
+
+def validate_labor_hours(work_orders, labor_transactions, production_outputs,
+                         routing_operations, routing_versions,
+                         file="23_labor_transaction.xlsx", sheet="labor_transaction"):
+    """
+    (wo_no, operation_seq) 단위로 실제공수 합계가 표준공수를 5% 초과하면
+    EXCESSIVE_LABOR_HOURS를 보고한다.
+
+    표준공수 = routing_operation.standard_hours × production_output.good_qty
+    (phase1_dataset_build_spec.md "표준공수 = routing_operation.standard_hours × good_qty").
+    판정은 초과 방향만 본다 — `actual_total > standard_total × 1.05`
+    (14_tolerance_rule.xlsx LABOR_HOURS는 apply_rule=PCT_ONLY이므로 abs_tolerance는
+    쓰지 않는다).
+
+    제외 대상(새 오류 코드를 만들지 않고 계산 대상에서만 제외):
+      - good_qty=0(표준공수=0)인 (WO, operation) — ZERO_DENOMINATOR와 동일한
+        "분모 0 → 계산 불가" 원칙, 0으로 나눈 것과 같은 퇴화 상태를 그대로 오류로
+        보지 않는다.
+      - routing에 없는 operation_seq — UNKNOWN_ROUTING_OPERATION이 이미 담당.
+
+    행 단위 이상치(음수 시간, actual_rate<=0 등)는 별도로 걸러내지 않고 실제
+    actual_hours 값 그대로 합산한다 — 그건 validate_labor()의 행 단위 검증 책임이다.
+    """
+    issues = []
+
+    routing_version_by_product = {}
+    for rv in routing_versions:
+        product_code = rv.get("product_code")
+        rvid = rv.get("routing_version_id")
+        if product_code is not None and rvid is not None:
+            routing_version_by_product.setdefault(product_code, rvid)
+
+    standard_hours_by_key = {}
+    for op in routing_operations:
+        rvid = op.get("routing_version_id")
+        seq = op.get("operation_seq")
+        hours = _to_decimal(op.get("standard_hours"))
+        if rvid is None or seq is None or hours is None:
+            continue
+        standard_hours_by_key[(rvid, seq)] = hours
+
+    good_qty_by_wo = {}
+    for po in production_outputs:
+        wo_no = po.get("wo_no")
+        qty = _to_decimal(po.get("good_qty"))
+        if wo_no is None or qty is None:
+            continue
+        good_qty_by_wo[wo_no] = good_qty_by_wo.get(wo_no, Decimal("0")) + qty
+
+    wo_map = {w.get("wo_no"): w for w in work_orders}
+
+    actual_hours_by_key = {}
+    for r in labor_transactions:
+        wo_no = r.get("wo_no")
+        seq = r.get("operation_seq")
+        hours = _to_decimal(r.get("actual_hours"))
+        if wo_no is None or seq is None or hours is None:
+            continue
+        key = (wo_no, seq)
+        actual_hours_by_key[key] = actual_hours_by_key.get(key, Decimal("0")) + hours
+
+    for (wo_no, seq), actual_total in actual_hours_by_key.items():
+        wo_row = wo_map.get(wo_no)
+        if wo_row is None:
+            continue
+
+        routing_version_id = wo_row.get("routing_version_id")
+        if routing_version_id is None:
+            routing_version_id = routing_version_by_product.get(wo_row.get("product_code"))
+        if routing_version_id is None:
+            continue
+
+        standard_per_unit = standard_hours_by_key.get((routing_version_id, seq))
+        if standard_per_unit is None:
+            continue
+
+        good_qty = good_qty_by_wo.get(wo_no)
+        if good_qty is None or good_qty == 0:
+            continue
+
+        standard_total = standard_per_unit * good_qty
+        threshold = standard_total * (Decimal("1") + LABOR_HOURS_PCT_TOLERANCE)
+
+        if actual_total > threshold:
+            issues.append(_issue(
+                "EXCESSIVE_LABOR_HOURS", "WARNING", file, sheet, None,
+                f"WO={wo_no}, operation_seq={seq}: actual_total={actual_total}, "
+                f"standard_total={standard_total}, threshold={threshold}",
+                wo_no
+            ))
+
+    return issues
