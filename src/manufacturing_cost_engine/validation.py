@@ -71,6 +71,11 @@ def validate_work_orders(rows, products, file="20_work_order.xlsx", sheet="work_
 
 def validate_material_issues(rows, materials, work_orders, cost_centers,
                              file="22_material_issue.xlsx", sheet="material_issue"):
+    """
+    참고: 실제 22_material_issue.xlsx에는 amount 컬럼이 없다(issued_qty × unit_cost와
+    대사할 실제 금액 자체가 존재하지 않음). 그래서 AMOUNT_MISMATCH는 이 함수에서
+    검증하지 않는다 — 비교할 대상이 없는 상태를 억지로 만들지 않는다.
+    """
     issues = []
     material_set = {r.get("material_code") for r in materials}
     wo_set = {r.get("wo_no") for r in work_orders}
@@ -97,22 +102,21 @@ def validate_material_issues(rows, materials, work_orders, cost_centers,
                 "UNKNOWN_COST_CENTER", "CRITICAL", file, sheet, r.get("_source_row"),
                 f"등록되지 않은 원가센터: {cc}", cc
             ))
+
         try:
             qty = Decimal(str(r.get("issued_qty")))
-            amount = Decimal(str(r.get("amount")))
-            unit = Decimal(str(r.get("unit_cost")))
         except (InvalidOperation, TypeError):
+            issues.append(_issue(
+                "INVALID_DECIMAL", "CRITICAL", file, sheet, r.get("_source_row"),
+                f"issued_qty를 숫자로 변환할 수 없습니다: {r.get('issued_qty')!r}",
+                r.get("issue_doc_no")
+            ))
             continue
+
         if r.get("issue_type") == "ISSUE" and qty < 0:
             issues.append(_issue(
                 "NEGATIVE_QUANTITY", "ERROR", file, sheet, r.get("_source_row"),
                 "ISSUE의 issued_qty가 음수입니다.", r.get("issue_doc_no")
-            ))
-        expected = (unit * qty).quantize(Decimal("0.0001"))
-        if amount != expected:
-            issues.append(_issue(
-                "AMOUNT_MISMATCH", "ERROR", file, sheet, r.get("_source_row"),
-                f"amount={amount}, expected={expected}", r.get("issue_doc_no")
             ))
     return issues
 

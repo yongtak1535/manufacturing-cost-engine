@@ -30,6 +30,51 @@ def test_material_issue_target_required():
     )
     assert any(i.code == "ISSUE_TARGET_MISSING" for i in issues)
 
+def test_material_issue_negative_quantity_detected():
+    # 실제 MI-2607-055(issued_qty=-5)와 동일한 케이스. amount 컬럼이 없어도
+    # issued_qty만으로 정상 검출되어야 한다.
+    rows = [{
+        "material_code": "MAT-001", "wo_no": "WO-1", "cost_center_code": None,
+        "issued_qty": "-5", "unit_cost": "850", "issue_type": "ISSUE", "_source_row": 2,
+    }]
+    issues = validate_material_issues(
+        rows, [{"material_code": "MAT-001"}], [{"wo_no": "WO-1"}], []
+    )
+    assert any(i.code == "NEGATIVE_QUANTITY" for i in issues)
+
+def test_material_issue_invalid_decimal_detected():
+    # 실제 MI-2607-052(issued_qty="1,2 3 4")와 동일한 케이스.
+    rows = [{
+        "material_code": "MAT-011", "wo_no": "WO-1", "cost_center_code": None,
+        "issued_qty": "1,2 3 4", "unit_cost": "42000", "issue_type": "ISSUE",
+        "_source_row": 2,
+    }]
+    issues = validate_material_issues(
+        rows, [{"material_code": "MAT-011"}], [{"wo_no": "WO-1"}], []
+    )
+    assert any(i.code == "INVALID_DECIMAL" and i.severity == "CRITICAL" for i in issues)
+
+def test_material_issue_no_amount_mismatch_without_amount_column():
+    # 실제 데이터엔 amount 컬럼이 없으므로 AMOUNT_MISMATCH를 임의로 만들지 않는다.
+    rows = [{
+        "material_code": "MAT-001", "wo_no": "WO-1", "cost_center_code": None,
+        "issued_qty": "10", "unit_cost": "100", "issue_type": "ISSUE", "_source_row": 2,
+    }]
+    issues = validate_material_issues(
+        rows, [{"material_code": "MAT-001"}], [{"wo_no": "WO-1"}], []
+    )
+    assert not any(i.code == "AMOUNT_MISMATCH" for i in issues)
+
+def test_material_issue_normal_positive_quantity_no_issue():
+    rows = [{
+        "material_code": "MAT-001", "wo_no": "WO-1", "cost_center_code": None,
+        "issued_qty": "10", "unit_cost": "100", "issue_type": "ISSUE", "_source_row": 2,
+    }]
+    issues = validate_material_issues(
+        rows, [{"material_code": "MAT-001"}], [{"wo_no": "WO-1"}], []
+    )
+    assert issues == []
+
 
 def _wo(wo_no="WO-1", bom_version_id="BOM-1", planned_qty="10", product_code="P-100",
         period_key="2026-07", end_date=None, company_code="HB01"):

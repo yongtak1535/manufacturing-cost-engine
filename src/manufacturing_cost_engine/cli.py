@@ -7,7 +7,8 @@ from .loader import load_dataset
 from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
-    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation
+    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
+    validate_bom_issues
 )
 from .cost_engine import calculate_actual_total_cost_by_wo
 
@@ -33,6 +34,13 @@ def main():
         rows("08_material_master.xlsx", "material"),
         rows("20_work_order.xlsx", "work_order"),
         rows("03_cost_center.xlsx", "cost_center"),
+    )
+
+    issues += validate_bom_issues(
+        rows("20_work_order.xlsx", "work_order"),
+        rows("10_bom.xlsx", "bom_item"),
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("08_material_master.xlsx", "material"),
     )
 
     issues += validate_routing(
