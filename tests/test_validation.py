@@ -1,7 +1,7 @@
 from manufacturing_cost_engine.validation import (
     validate_period_rows, validate_gl_balance, validate_material_issues,
     validate_bom_issues, validate_routing, validate_account_mapping,
-    validate_standard_cost, validate_actual_cost
+    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation
 )
 
 def test_period_key_consistency():
@@ -31,12 +31,14 @@ def test_material_issue_target_required():
     assert any(i.code == "ISSUE_TARGET_MISSING" for i in issues)
 
 
-def _wo(wo_no="WO-1", bom_version_id="BOM-1", planned_qty="10", product_code="P-100"):
+def _wo(wo_no="WO-1", bom_version_id="BOM-1", planned_qty="10", product_code="P-100",
+        period_key="2026-07", end_date=None, company_code="HB01"):
     return {
-        "wo_no": wo_no, "product_code": product_code, "period_key": "2026-07",
+        "company_code": company_code, "wo_no": wo_no, "product_code": product_code,
+        "period_key": period_key,
         "bom_version_id": bom_version_id, "planned_qty": planned_qty,
         "uom": "EA", "wo_status": "OPEN",
-        "start_date": "2026-07-01", "end_date": None,
+        "start_date": "2026-07-01", "end_date": end_date,
     }
 
 def _bom_item(bom_version_id="BOM-1", line_no=1, material_code="MAT-001",
@@ -47,11 +49,11 @@ def _bom_item(bom_version_id="BOM-1", line_no=1, material_code="MAT-001",
     }
 
 def _issue_row(wo_no="WO-1", material_code="MAT-001", issued_qty="1", uom="EA",
-               issue_type="ISSUE", source_row=2):
+               issue_type="ISSUE", source_row=2, unit_cost="10"):
     return {
         "issue_doc_no": "MI-1", "issue_line_no": source_row - 1, "wo_no": wo_no,
         "material_code": material_code, "issued_qty": issued_qty, "uom": uom,
-        "unit_cost": "10", "issue_type": issue_type, "_source_row": source_row,
+        "unit_cost": unit_cost, "issue_type": issue_type, "_source_row": source_row,
     }
 
 def _material(material_code="MAT-001", base_uom="EA"):
@@ -385,9 +387,9 @@ def test_routing_operation_seq_must_be_a_whole_number():
 
 def _gl_line(company_code="HB01", document_no="GL-1", line_no=1,
              gl_account_code="51100", debit="100000", credit="0",
-             cost_center_code=None, source_row=2):
+             cost_center_code=None, source_row=2, period_key="2026-07"):
     return {
-        "company_code": company_code, "period_key": "2026-07",
+        "company_code": company_code, "period_key": period_key,
         "document_no": document_no, "line_no": line_no,
         "posting_date": "2026-07-31", "gl_account_code": gl_account_code,
         "debit": debit, "credit": credit, "cost_center_code": cost_center_code,
@@ -731,3 +733,249 @@ def test_actual_cost_overhead_not_allocated():
         i.code == "OVERHEAD_NOT_ALLOCATED" and i.severity == "NOT_ALLOCATED"
         for i in issues
     )
+
+
+def _period(period_key="2026-07", end_date="2026-07-31", company_code="HB01"):
+    return {"company_code": company_code, "period_key": period_key, "end_date": end_date}
+
+def _labor_row(wo_no="WO-1", actual_hours="1", actual_rate="24000", amount="24000",
+               direct_indirect="DIRECT", work_center_code="WC-20"):
+    return {
+        "wo_no": wo_no, "actual_hours": actual_hours, "actual_rate": actual_rate,
+        "amount": amount, "direct_indirect": direct_indirect,
+        "work_center_code": work_center_code,
+    }
+
+def test_gl_recon_dm_within_tolerance_no_issue():
+    # GL=100000, Actual=100050, diff=50, tolerance=max(10, 100050*0.001=100.05)=100.05
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="51100", debit="100000")],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [_wo()],
+        [_issue_row(issued_qty="10005", unit_cost="10")],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []
+
+def test_gl_recon_dm_exceeds_tolerance():
+    # GL=100000, Actual=200000, diff=100000, tolerance=max(10, 200)=200 -> 초과
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="51100", debit="100000")],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [_wo()],
+        [_issue_row(issued_qty="20000", unit_cost="10")],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    dm_issues = [i for i in issues if i.code == "GL_RECON_DIFFERENCE" and i.related_entity == "DM"]
+    assert len(dm_issues) == 1
+    assert dm_issues[0].severity == "ERROR"
+
+def test_gl_recon_dl_within_tolerance_no_issue():
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="52100", debit="180000")],
+        [_account_mapping(gl_account_code="52100", cost_element_code="DL")],
+        [_wo()],
+        [],
+        [_labor_row(amount="180050")],
+        [],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []
+
+def test_gl_recon_dl_exceeds_tolerance():
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="52100", debit="180000")],
+        [_account_mapping(gl_account_code="52100", cost_element_code="DL")],
+        [_wo()],
+        [],
+        [_labor_row(amount="500000")],
+        [],
+        [_product()],
+        [_period()],
+    )
+    dl_issues = [i for i in issues if i.code == "GL_RECON_DIFFERENCE" and i.related_entity == "DL"]
+    assert len(dl_issues) == 1
+
+def test_gl_recon_dm_and_dl_both_exceed_are_independent_issues():
+    # 실제 데이터처럼 DM/DL이 둘 다 초과하면 90_expected_results.xlsx의 expected_value=1에
+    # 맞추기 위해 하나로 합치거나 임의로 제외하지 않고 각각 독립적으로 보고한다.
+    issues = validate_gl_reconciliation(
+        [
+            _gl_line(document_no="GL-1", gl_account_code="51100", debit="100000"),
+            _gl_line(document_no="GL-2", gl_account_code="52100", debit="180000"),
+        ],
+        [
+            _account_mapping(gl_account_code="51100", cost_element_code="DM"),
+            _account_mapping(gl_account_code="52100", cost_element_code="DL"),
+        ],
+        [_wo()],
+        [_issue_row(issued_qty="20000", unit_cost="10")],
+        [_labor_row(amount="500000")],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    gl_recon = [i for i in issues if i.code == "GL_RECON_DIFFERENCE"]
+    assert len(gl_recon) == 2
+    assert {i.related_entity for i in gl_recon} == {"DM", "DL"}
+
+def test_gl_recon_excludes_oh_even_when_it_differs():
+    # OH 계정(53100)은 실제 차이가 있어도 이번 GL Reconciliation 대상이 아니다(§7-7).
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="53100", debit="10000", cost_center_code="CC-100")],
+        [_account_mapping(gl_account_code="53100", cost_center_code="CC-100",
+                          cost_element_code="OH")],
+        [_wo()],
+        [],
+        [],
+        [],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []
+
+def test_gl_recon_actual_only_no_gl_entry_still_compared():
+    # GL에 해당 cost_element 계정 자체가 없으면 GL=0으로 취급해 비교한다(스킵하지 않음).
+    issues = validate_gl_reconciliation(
+        [],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [_wo()],
+        [_issue_row(issued_qty="20000", unit_cost="10")],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    assert any(
+        i.code == "GL_RECON_DIFFERENCE" and i.related_entity == "DM" for i in issues
+    )
+
+def test_gl_recon_multiple_periods_compared_independently():
+    issues = validate_gl_reconciliation(
+        [
+            _gl_line(document_no="GL-1", gl_account_code="51100", debit="100000",
+                     period_key="2026-07"),
+            _gl_line(document_no="GL-2", gl_account_code="51100", debit="500000",
+                     period_key="2026-08"),
+        ],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [
+            _wo(wo_no="WO-1", period_key="2026-07"),
+            _wo(wo_no="WO-2", period_key="2026-08"),
+        ],
+        [
+            _issue_row(wo_no="WO-1", issued_qty="10005", unit_cost="10", source_row=2),
+            _issue_row(wo_no="WO-2", issued_qty="20000", unit_cost="10", source_row=3),
+        ],
+        [],
+        [_material()],
+        [_product()],
+        [_period(period_key="2026-07"), _period(period_key="2026-08", end_date="2026-08-31")],
+    )
+    gl_recon = [i for i in issues if i.code == "GL_RECON_DIFFERENCE"]
+    assert len(gl_recon) == 1
+    assert "period=2026-08" in gl_recon[0].message
+
+def test_gl_recon_decimal_boundary_within_tolerance():
+    # diff가 정확히 tolerance(10)와 같으면 초과가 아니므로 issue가 없다(경계 포함).
+    issues = validate_gl_reconciliation(
+        [],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [_wo()],
+        [_issue_row(issued_qty="1", unit_cost="10")],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []
+
+def test_gl_recon_excludes_period_spanning_wo_from_actual():
+    # 실제 WO-2607-018/019와 동일한 구조: end_date가 period 종료일을 넘는 WO.
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="51100", debit="100000")],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [_wo(wo_no="WO-1", end_date="2026-08-05")],
+        [_issue_row(wo_no="WO-1", issued_qty="10000", unit_cost="10")],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    gl_recon = [i for i in issues if i.code == "GL_RECON_DIFFERENCE"]
+    assert len(gl_recon) == 1
+    assert "excluded_wo_amount=100000" in gl_recon[0].message
+    excluded = [i for i in issues if i.code == "EXCLUDED_WO"]
+    assert len(excluded) == 1
+    assert excluded[0].related_entity == "WO-1"
+
+def test_gl_recon_excluded_wo_amount_only_counts_spanning_wo():
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="51100", debit="10000")],
+        [_account_mapping(gl_account_code="51100", cost_element_code="DM")],
+        [
+            _wo(wo_no="WO-1", end_date=None),
+            _wo(wo_no="WO-2", end_date="2026-08-05"),
+        ],
+        [
+            _issue_row(wo_no="WO-1", issued_qty="1000", unit_cost="10", source_row=2),
+            _issue_row(wo_no="WO-2", issued_qty="5000", unit_cost="10", source_row=3),
+        ],
+        [],
+        [_material()],
+        [_product()],
+        [_period()],
+    )
+    # WO-2의 5만원이 제외되고 WO-1의 1만원만 남아 GL(1만원)과 정확히 일치한다.
+    assert not any(i.code == "GL_RECON_DIFFERENCE" for i in issues)
+    excluded = [i for i in issues if i.code == "EXCLUDED_WO"]
+    assert len(excluded) == 1
+    assert excluded[0].related_entity == "WO-2"
+
+def test_gl_recon_open_wo_without_end_date_not_excluded():
+    # end_date가 아예 없는(아직 진행 중인) WO는 기간 걸침 여부를 판단할 근거가 없어
+    # EXCLUDED_WO 대상이 아니다.
+    issues = validate_gl_reconciliation(
+        [], [], [_wo(wo_no="WO-1", end_date=None)], [], [], [], [_product()], [_period()]
+    )
+    assert not any(i.code == "EXCLUDED_WO" for i in issues)
+
+def test_gl_recon_ignores_ambiguous_mapped_gl_account():
+    # 53500처럼 동순위 매핑이 모호한 계정은 UNMAPPED_GL/MAPPING_AMBIGUOUS로 이미
+    # validate_account_mapping()이 보고하므로, 여기서는 조용히 집계에서 제외한다.
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="53500", debit="25000", cost_center_code=None)],
+        [
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="OH", priority=10),
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="DM", priority=10),
+        ],
+        [_wo()],
+        [],
+        [],
+        [],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []
+
+def test_gl_recon_ignores_unmapped_gl_account():
+    issues = validate_gl_reconciliation(
+        [_gl_line(gl_account_code="53900", debit="30000")],
+        [],
+        [_wo()],
+        [],
+        [],
+        [],
+        [_product()],
+        [_period()],
+    )
+    assert issues == []

@@ -5,6 +5,7 @@ from datetime import date, datetime
 from typing import Iterable
 
 from .models import ValidationIssue
+from .cost_engine import calculate_actual_material_cost, calculate_actual_labor_cost
 
 def _issue(code, severity, file, sheet, row, message, entity=None):
     return ValidationIssue(code, severity, file, sheet, row, message, entity)
@@ -745,5 +746,203 @@ def validate_actual_cost(work_orders, production_outputs, labor_transactions,
             f"overhead_rate가 없어 OH가 배부되지 않습니다.",
             cost_center_code
         ))
+
+    return issues
+
+# GL Reconciliation은 phase1_dataset_build_spec.md §7-7 근거로 DM/DL만 비교한다.
+# OH/GA는 발생주의 조정 계정 성격이라 원천 거래 대사가 원칙적으로 불가능하므로 제외한다.
+RECONCILED_COST_ELEMENTS = ("DM", "DL")
+
+# 14_tolerance_rule.xlsx GL_RECON: abs_tolerance=10, pct_tolerance=0.001, GREATER_OF.
+GL_RECON_ABS_TOLERANCE = Decimal("10")
+GL_RECON_PCT_TOLERANCE = Decimal("0.001")
+
+def _resolve_gl_account_mapping(gl_line, mapping_index):
+    """
+    validate_account_mapping()과 동일한 우선순위/구체성 규칙으로 GL 라인 하나를 해석한다.
+    성공하면 매핑 행(dict)을, 매핑이 없거나(0건) 모호하면(동순위 2건 이상) None을 반환한다.
+    그 실패 케이스(UNMAPPED_GL/MAPPING_AMBIGUOUS)는 validate_account_mapping()이 이미
+    보고하므로 여기서는 다시 issue를 만들지 않고 단순히 집계에서 제외한다.
+    """
+    candidates = [
+        m for m in mapping_index.get(gl_line.get("company_code"), {}).get(
+            gl_line.get("gl_account_code"), []
+        )
+        if m.get("cost_center_code") == gl_line.get("cost_center_code")
+        or m.get("cost_center_code") is None
+    ]
+    if not candidates:
+        return None
+
+    top_priority = max(_mapping_priority(m) for m in candidates)
+    top_candidates = [m for m in candidates if _mapping_priority(m) == top_priority]
+
+    if any(m.get("cost_center_code") is not None for m in top_candidates):
+        top_candidates = [
+            m for m in top_candidates if m.get("cost_center_code") is not None
+        ]
+
+    if len(top_candidates) != 1:
+        return None
+
+    return top_candidates[0]
+
+def _gl_dm_dl_totals(gl_transactions, account_mappings):
+    """(company_code, period_key, cost_element_code) -> Σ debit. DM/DL만 집계한다."""
+    mapping_index = _index_account_mappings(account_mappings)
+    totals = {}
+
+    for r in gl_transactions:
+        debit = _to_decimal(r.get("debit"))
+        credit = _to_decimal(r.get("credit"))
+        if debit is None or debit <= 0:
+            continue
+        if credit is not None and credit != 0:
+            continue
+
+        mapping_row = _resolve_gl_account_mapping(r, mapping_index)
+        if mapping_row is None:
+            continue
+
+        cost_element_code = mapping_row.get("cost_element_code")
+        if cost_element_code not in RECONCILED_COST_ELEMENTS:
+            continue
+
+        key = (r.get("company_code"), r.get("period_key"), cost_element_code)
+        totals[key] = totals.get(key, Decimal("0")) + debit
+
+    return totals
+
+def _period_end_dates(periods):
+    """(company_code, period_key) -> end_date 문자열(YYYY-MM-DD, 문자열 비교로 충분)."""
+    return {
+        (p.get("company_code"), p.get("period_key")): p.get("end_date")
+        for p in periods if p.get("period_key") is not None
+    }
+
+def _is_period_spanning(work_order, period_end_dates):
+    """
+    work_order.end_date가 소속 period의 종료일보다 늦으면 기간 걸침으로 본다
+    (phase1_dataset_build_spec.md R-6/E-026). end_date가 없는(아직 진행 중인) WO는
+    판단할 근거가 없으므로 걸침으로 간주하지 않는다.
+    """
+    end_date = work_order.get("end_date")
+    if end_date is None:
+        return False
+
+    period_end = period_end_dates.get(
+        (work_order.get("company_code"), work_order.get("period_key"))
+    )
+    if period_end is None:
+        return False
+
+    return str(end_date) > str(period_end)
+
+def _actual_dm_dl_totals(work_orders, material_issues, labor_transactions, materials,
+                         products, periods):
+    """
+    (company_code, period_key, cost_element_code) -> Σ Actual DM/DL.
+    calculate_actual_material_cost()/calculate_actual_labor_cost()를 그대로 재사용해
+    WO별 금액을 구한 뒤, 기간 걸침 WO(work_order.end_date > period.end_date)만
+    집계에서 제외하고 그 금액을 별도로 모은다.
+
+    Returns:
+        (totals, excluded_wo_amount) — 둘 다 (company, period, element) 키의 dict
+    """
+    material_by_wo = calculate_actual_material_cost(
+        work_orders, material_issues, materials, products
+    )
+    labor_by_wo = calculate_actual_labor_cost(work_orders, labor_transactions, products)
+    period_end_dates = _period_end_dates(periods)
+    wo_map = {w.get("wo_no"): w for w in work_orders}
+
+    totals = {}
+    excluded_wo_amount = {}
+
+    for cost_element_code, amounts_by_wo in (("DM", material_by_wo), ("DL", labor_by_wo)):
+        for wo_no, amount in amounts_by_wo.items():
+            wo_row = wo_map.get(wo_no)
+            if wo_row is None:
+                continue
+
+            key = (wo_row.get("company_code"), wo_row.get("period_key"), cost_element_code)
+            if _is_period_spanning(wo_row, period_end_dates):
+                excluded_wo_amount[key] = excluded_wo_amount.get(key, Decimal("0")) + amount
+                continue
+
+            totals[key] = totals.get(key, Decimal("0")) + amount
+
+    return totals, excluded_wo_amount
+
+def _gl_recon_tolerance(actual_amount):
+    """
+    GL_RECON(abs=10, pct=0.001, GREATER_OF)을 적용한다.
+    pct의 기준(base)을 GL/Actual 중 어느 쪽으로 할지는 14_tolerance_rule.xlsx나
+    설계 문서에 확정되어 있지 않다(phase1_dataset_build_spec.md §J-1-5,
+    "GL_RECON 허용차이"는 미확정 항목으로 명시됨). 여기서는 Actual Cost 금액을
+    기준으로 삼는다 — 이는 확정된 설계 규칙이 아니라 구현상의 선택이다.
+    """
+    return max(GL_RECON_ABS_TOLERANCE, abs(actual_amount) * GL_RECON_PCT_TOLERANCE)
+
+def validate_gl_reconciliation(gl_transactions, account_mappings, work_orders,
+                               material_issues, labor_transactions, materials,
+                               products, periods):
+    """
+    (company_code, period_key, cost_element_code) 단위로 GL과 Actual Cost를 대사한다.
+
+    확정된 범위:
+      - DM/DL만 비교한다(§7-7). OH/GA는 다루지 않는다 — 실제로 OH도 tolerance를
+        벗어나는 것이 확인되었지만, 설계 원칙(발생주의 조정 계정은 원천 거래로
+        대사 불가)에 따라 이번 GL Reconciliation 대상에 포함하지 않는다.
+      - GL 쪽은 debit>0 AND credit==0인 라인만, account_mapping으로 해석 가능한
+        경우에만 집계한다. UNMAPPED_GL/MAPPING_AMBIGUOUS는 validate_account_mapping()
+        이 이미 보고하므로 여기서는 조용히 제외한다.
+      - WO별로 GL 금액을 임의 배분하지 않는다(GL에 wo_no가 없어 근거가 없음).
+      - 기간을 넘겨 끝나는 WO는 Actual 집계에서 제외하고 excluded_wo_amount로
+        메시지에 표시하며, 그 WO 자체는 EXCLUDED_WO로 별도 보고한다.
+
+    90_expected_results.xlsx의 E-027(expected_value=1)과 91_error_catalog.xlsx의
+    행 범위(30~44, 실제로는 DM/DL이 아니라 OH 계정)는 서로 맞지 않는 내부 불일치가
+    있음이 확인되었다. 이 함수는 그 숫자를 맞추기 위해 DM 또는 DL을 임의로 제외하거나
+    합치지 않으며, 실제 데이터 기준으로 DM/DL이 각각 tolerance를 초과하면 그대로
+    2건의 GL_RECON_DIFFERENCE를 보고한다.
+    """
+    issues = []
+
+    gl_totals = _gl_dm_dl_totals(gl_transactions, account_mappings)
+    actual_totals, excluded_wo_amount = _actual_dm_dl_totals(
+        work_orders, material_issues, labor_transactions, materials, products, periods
+    )
+
+    keys = set(gl_totals) | set(actual_totals)
+    for key in keys:
+        company_code, period_key, cost_element_code = key
+        gl_amount = gl_totals.get(key, Decimal("0"))
+        actual_amount = actual_totals.get(key, Decimal("0"))
+        difference = gl_amount - actual_amount
+        tolerance = _gl_recon_tolerance(actual_amount)
+
+        if abs(difference) > tolerance:
+            issues.append(_issue(
+                "GL_RECON_DIFFERENCE", "ERROR", "24_gl_transaction.xlsx",
+                "gl_transaction", None,
+                f"company={company_code}, period={period_key}, "
+                f"element={cost_element_code}: GL={gl_amount}, Actual={actual_amount}, "
+                f"diff={difference}, tolerance={tolerance}, "
+                f"excluded_wo_amount={excluded_wo_amount.get(key, Decimal('0'))}",
+                cost_element_code
+            ))
+
+    period_end_dates = _period_end_dates(periods)
+    for wo in work_orders:
+        if _is_period_spanning(wo, period_end_dates):
+            issues.append(_issue(
+                "EXCLUDED_WO", "REVIEW_REQUIRED", "20_work_order.xlsx", "work_order",
+                wo.get("_source_row"),
+                f"WO={wo.get('wo_no')}: end_date={wo.get('end_date')}가 period "
+                f"{wo.get('period_key')}의 종료일을 넘어 GL Reconciliation Actual "
+                f"집계에서 제외됩니다.",
+                wo.get("wo_no")
+            ))
 
     return issues

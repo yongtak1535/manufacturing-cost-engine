@@ -7,7 +7,7 @@ from .loader import load_dataset
 from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
-    validate_standard_cost, validate_actual_cost
+    validate_standard_cost, validate_actual_cost, validate_gl_reconciliation
 )
 from .cost_engine import calculate_actual_total_cost_by_wo
 
@@ -108,6 +108,17 @@ def main():
         work_centers,
         overhead_rates,
         products,
+    )
+
+    issues += validate_gl_reconciliation(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("05_account_mapping.xlsx", "account_mapping"),
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        labor_rows,
+        rows("08_material_master.xlsx", "material"),
+        products,
+        rows("02_period.xlsx", "period"),
     )
 
     print(f"Loaded sheets: {len(data)}")
