@@ -313,3 +313,124 @@ def calculate_actual_unit_cost_by_wo(
         result[wo_no] = calculate_unit_cost(totals["total_cost"], good_qty)
 
     return result
+
+
+def calculate_total_variance_by_wo(
+    work_orders,
+    material_issues,
+    labor_transactions,
+    materials,
+    work_centers,
+    overhead_rates,
+    products,
+    production_outputs,
+    standard_cost_header,
+) -> dict[str, dict]:
+    """
+    Phase 1 Total Variance: wo_no -> {"flexed_standard_dm/dl/oh/total",
+    "actual_material_cost/labor_cost/overhead_cost/total_cost",
+    "dm_variance/dl_variance/oh_variance", "total_variance"}.
+
+    Total Variance = Actual Cost - Flexed Standard Cost
+    Flexed Standard = standard_cost.standard_amount(제품 1단위당) × 해당 WO의
+    good_qty 합계(production_output) — 표준을 실제 생산량에 맞춰 flex한다.
+
+    Actual Cost는 calculate_actual_total_cost_by_wo()를 그대로 재사용한다(재계산하지
+    않음). 이 WO가 그 결과에 아예 없으면(실적 거래가 전혀 없는 경우) Actual은 0으로
+    취급한다 — 이것도 유효한 계산 결과이지 계산 불가 상태가 아니다.
+
+    다음 WO는 결과에서 제외한다(새 오류 코드를 만들지 않고 생략만 한다 —
+    이미 NO_PRODUCTION_OUTPUT/ZERO_DENOMINATOR/STANDARD_COST_MISSING이 별도로 보고함):
+      - good_qty 합계가 없거나 0인 WO
+      - 제품의 standard_cost header가 전혀 없는 WO(DM/DL/OH 전부 없음)
+
+    DM/DL/OH 중 일부만 없는 경우는 있는 요소만 계산하고 없는 요소는 결과 dict에
+    포함하지 않는다(전부 없어야만 WO 전체를 생략한다).
+
+    기간을 넘겨 끝나는 WO(GL Reconciliation의 EXCLUDED_WO 대상)는 여기서는 별도로
+    제외하지 않는다 — Total Variance는 기간 집계가 아니라 WO 단위 계산이라
+    기간 걸침과 무관하다.
+    """
+    actual_totals_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders, material_issues, labor_transactions, materials,
+        work_centers, overhead_rates, products,
+    )
+
+    good_qty_by_wo: dict[str, Decimal] = {}
+    for po in production_outputs:
+        wo_no = po.get("wo_no")
+        qty = _strict_decimal(po.get("good_qty"))
+        if wo_no is None or qty is None:
+            continue
+        good_qty_by_wo[wo_no] = good_qty_by_wo.get(wo_no, Decimal("0")) + qty
+
+    standard_amount_by_key: dict[tuple, Decimal] = {}
+    for h in standard_cost_header:
+        product_code = h.get("product_code")
+        period_key = h.get("period_key")
+        cost_element_code = h.get("cost_element_code")
+        amount = _strict_decimal(h.get("standard_amount"))
+        if product_code is None or period_key is None or cost_element_code is None:
+            continue
+        if amount is None:
+            continue
+        standard_amount_by_key[(product_code, period_key, cost_element_code)] = amount
+
+    zero = Decimal("0")
+    result: dict[str, dict] = {}
+
+    for wo in work_orders:
+        wo_no = wo.get("wo_no")
+        if wo_no is None:
+            continue
+
+        good_qty = good_qty_by_wo.get(wo_no)
+        if not good_qty:
+            continue
+
+        product_code = wo.get("product_code")
+        period_key = wo.get("period_key")
+
+        dm_standard = standard_amount_by_key.get((product_code, period_key, "DM"))
+        dl_standard = standard_amount_by_key.get((product_code, period_key, "DL"))
+        oh_standard = standard_amount_by_key.get((product_code, period_key, "OH"))
+        if dm_standard is None and dl_standard is None and oh_standard is None:
+            continue
+
+        actual = actual_totals_by_wo.get(wo_no, {
+            "material_cost": zero, "labor_cost": zero,
+            "overhead_cost": zero, "total_cost": zero,
+        })
+
+        entry: dict = {}
+        flexed_amounts = []
+
+        if dm_standard is not None:
+            flexed_dm = round_amount(dm_standard * good_qty)
+            entry["flexed_standard_dm"] = flexed_dm
+            entry["actual_material_cost"] = actual["material_cost"]
+            entry["dm_variance"] = round_amount(actual["material_cost"] - flexed_dm)
+            flexed_amounts.append(flexed_dm)
+
+        if dl_standard is not None:
+            flexed_dl = round_amount(dl_standard * good_qty)
+            entry["flexed_standard_dl"] = flexed_dl
+            entry["actual_labor_cost"] = actual["labor_cost"]
+            entry["dl_variance"] = round_amount(actual["labor_cost"] - flexed_dl)
+            flexed_amounts.append(flexed_dl)
+
+        if oh_standard is not None:
+            flexed_oh = round_amount(oh_standard * good_qty)
+            entry["flexed_standard_oh"] = flexed_oh
+            entry["actual_overhead_cost"] = actual["overhead_cost"]
+            entry["oh_variance"] = round_amount(actual["overhead_cost"] - flexed_oh)
+            flexed_amounts.append(flexed_oh)
+
+        flexed_total = round_amount(sum(flexed_amounts, Decimal("0")))
+        entry["flexed_standard_total"] = flexed_total
+        entry["actual_total_cost"] = actual["total_cost"]
+        entry["total_variance"] = round_amount(actual["total_cost"] - flexed_total)
+
+        result[wo_no] = entry
+
+    return result

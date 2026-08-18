@@ -13,6 +13,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_actual_overhead_cost,
     calculate_actual_total_cost_by_wo,
     calculate_actual_unit_cost_by_wo,
+    calculate_total_variance_by_wo,
 )
 
 
@@ -121,6 +122,13 @@ def _overhead_rate(period_key="2026-07", cost_center_code="CC-100",
 
 def _production_output(wo_no="WO-1", good_qty="10"):
     return {"wo_no": wo_no, "good_qty": good_qty}
+
+def _standard_cost(product_code="P-100", period_key="2026-07",
+                    cost_element_code="DM", standard_amount="100"):
+    return {
+        "product_code": product_code, "period_key": period_key,
+        "cost_element_code": cost_element_code, "standard_amount": standard_amount,
+    }
 
 
 # --- calculate_actual_material_cost ---
@@ -310,3 +318,136 @@ def test_actual_unit_cost_by_wo_excludes_wo_without_production_output():
     totals = {"WO-1": {"total_cost": Decimal("1000.00")}}
     result = calculate_actual_unit_cost_by_wo(totals, [])
     assert result == {}
+
+
+# --- calculate_total_variance_by_wo ---
+
+def test_total_variance_by_wo_combines_dm_dl_oh_elements():
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [_issue(issued_qty="10", unit_cost="100")],
+        [_labor(actual_hours="1", actual_rate="600", amount="600")],
+        [_material()],
+        [_work_center("WC-20", "CC-100")],
+        [_overhead_rate("2026-07", "CC-100", "200")],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [
+            _standard_cost(cost_element_code="DM", standard_amount="80"),
+            _standard_cost(cost_element_code="DL", standard_amount="50"),
+            _standard_cost(cost_element_code="OH", standard_amount="30"),
+        ],
+    )
+    wo = result["WO-1"]
+    assert wo["flexed_standard_dm"] == Decimal("800.00")
+    assert wo["flexed_standard_dl"] == Decimal("500.00")
+    assert wo["flexed_standard_oh"] == Decimal("300.00")
+    assert wo["flexed_standard_total"] == Decimal("1600.00")
+    assert wo["actual_material_cost"] == Decimal("1000.00")
+    assert wo["actual_labor_cost"] == Decimal("600")
+    assert wo["actual_overhead_cost"] == Decimal("200.00")
+    assert wo["actual_total_cost"] == Decimal("1800.00")
+    assert wo["dm_variance"] == Decimal("200.00")
+    assert wo["dl_variance"] == Decimal("100")
+    assert wo["oh_variance"] == Decimal("-100.00")
+    assert wo["total_variance"] == Decimal("200.00")
+
+def test_total_variance_by_wo_dm_only_when_dl_oh_standard_missing():
+    # 제품의 standard_cost에 DM만 있는 경우: 있는 요소만 계산하고 없는 요소는
+    # 결과 dict에 키를 넣지 않는다(전부 없어야만 WO 전체를 생략한다).
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [_issue(issued_qty="10", unit_cost="100")],
+        [],
+        [_material()],
+        [],
+        [],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [_standard_cost(cost_element_code="DM", standard_amount="80")],
+    )
+    wo = result["WO-1"]
+    assert wo["flexed_standard_dm"] == Decimal("800.00")
+    assert wo["dm_variance"] == Decimal("200.00")
+    assert "dl_variance" not in wo
+    assert "oh_variance" not in wo
+    assert wo["flexed_standard_total"] == Decimal("800.00")
+    assert wo["total_variance"] == Decimal("200.00")
+
+def test_total_variance_by_wo_excludes_wo_with_no_standard_cost_at_all():
+    # 실제 WO-2607-020(product_code=P-999, standard_cost 자체가 없음)과 동일한 케이스.
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [_issue(issued_qty="10", unit_cost="100")],
+        [],
+        [_material()],
+        [],
+        [],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [],
+    )
+    assert result == {}
+
+def test_total_variance_by_wo_excludes_zero_good_qty():
+    # 실제 WO-2607-009(good_qty=0)와 동일한 케이스.
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [_issue(issued_qty="10", unit_cost="100")],
+        [],
+        [_material()],
+        [],
+        [],
+        [_product()],
+        [_production_output(good_qty="0")],
+        [_standard_cost(cost_element_code="DM", standard_amount="80")],
+    )
+    assert result == {}
+
+def test_total_variance_by_wo_no_actual_cost_defaults_to_zero():
+    # 실적 거래가 전혀 없는 WO(예: WO-2607-018/019)도 Actual=0으로 계산되어야
+    # 하며, calculate_actual_total_cost_by_wo() 결과에 아예 없다고 해서 제외하지
+    # 않는다.
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [],
+        [],
+        [_material()],
+        [],
+        [],
+        [_product()],
+        [_production_output(good_qty="10")],
+        [
+            _standard_cost(cost_element_code="DM", standard_amount="80"),
+            _standard_cost(cost_element_code="DL", standard_amount="50"),
+            _standard_cost(cost_element_code="OH", standard_amount="30"),
+        ],
+    )
+    wo = result["WO-1"]
+    assert wo["actual_material_cost"] == Decimal("0")
+    assert wo["actual_labor_cost"] == Decimal("0")
+    assert wo["actual_overhead_cost"] == Decimal("0")
+    assert wo["actual_total_cost"] == Decimal("0")
+    assert wo["dm_variance"] == Decimal("-800.00")
+    assert wo["dl_variance"] == Decimal("-500.00")
+    assert wo["oh_variance"] == Decimal("-300.00")
+    assert wo["total_variance"] == Decimal("-1600.00")
+
+def test_total_variance_by_wo_decimal_precision():
+    result = calculate_total_variance_by_wo(
+        [_wo()],
+        [_issue(issued_qty="1", unit_cost="100.015")],
+        [],
+        [_material()],
+        [],
+        [],
+        [_product()],
+        [_production_output(good_qty="3")],
+        [_standard_cost(cost_element_code="DM", standard_amount="33.335")],
+    )
+    wo = result["WO-1"]
+    # standard_amount(33.335) x good_qty(3) = 100.005 -> ROUND_HALF_UP -> 100.01
+    assert wo["flexed_standard_dm"] == Decimal("100.01")
+    # issued_qty(1) x unit_cost(100.015) = 100.015 -> ROUND_HALF_UP -> 100.02
+    assert wo["actual_material_cost"] == Decimal("100.02")
+    assert wo["dm_variance"] == Decimal("0.01")

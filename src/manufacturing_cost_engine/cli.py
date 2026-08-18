@@ -11,7 +11,7 @@ from .validation import (
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files
 )
-from .cost_engine import calculate_actual_total_cost_by_wo
+from .cost_engine import calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo
 
 def main():
     parser = argparse.ArgumentParser()
@@ -156,6 +156,22 @@ def main():
         (v["total_cost"] for v in actual_cost_by_wo.values()), start=0
     )
     print(f"  Total Actual Cost (all WOs): {total_actual_cost}")
+
+    variance_by_wo = calculate_total_variance_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        labor_rows,
+        rows("08_material_master.xlsx", "material"),
+        work_centers,
+        overhead_rates,
+        products,
+        production_outputs,
+        rows("12_standard_cost.xlsx", "standard_cost"),
+    )
+    print(f"Total Variance calculated for {len(variance_by_wo)} work order(s)")
+    for wo_no in sorted(variance_by_wo):
+        v = variance_by_wo[wo_no]
+        print(f"  {wo_no}: total_variance={v['total_variance']}")
 
 if __name__ == "__main__":
     main()
