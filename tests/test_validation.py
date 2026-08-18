@@ -3,7 +3,7 @@ from manufacturing_cost_engine.validation import (
     validate_bom_issues, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_labor, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version, validate_labor_hours
+    validate_bom_version, validate_labor_hours, validate_duplicate_files
 )
 
 def test_period_key_consistency():
@@ -1362,3 +1362,39 @@ def test_labor_hours_sums_multiple_transactions():
     )
     # standard=1, threshold=1.05, 합계=1.1 -> 초과
     assert any(i.code == "EXCESSIVE_LABOR_HOURS" for i in issues)
+
+
+# --- DUPLICATE_FILE (validate_duplicate_files) ---
+
+def test_duplicate_files_none_no_issue():
+    assert validate_duplicate_files([]) == []
+
+def test_duplicate_files_detected():
+    # 실제 22_material_issue.xlsx / 25_material_issue_dup.xlsx와 동일한 구조.
+    issues = validate_duplicate_files([
+        ("27186e94", ["22_material_issue.xlsx", "25_material_issue_dup.xlsx"]),
+    ])
+    assert len(issues) == 1
+    assert issues[0].code == "DUPLICATE_FILE"
+    assert issues[0].severity == "WARNING"
+    assert "22_material_issue.xlsx" in issues[0].message
+    assert "25_material_issue_dup.xlsx" in issues[0].message
+
+def test_duplicate_files_one_issue_per_group_not_per_file():
+    # 같은 내용 파일이 3개여도 그룹당 1건만 보고한다.
+    issues = validate_duplicate_files([
+        ("hash-a", ["a1.xlsx", "a2.xlsx", "a3.xlsx"]),
+    ])
+    assert len(issues) == 1
+
+def test_duplicate_files_multiple_groups_reported_separately():
+    issues = validate_duplicate_files([
+        ("hash-a", ["a1.xlsx", "a2.xlsx"]),
+        ("hash-b", ["b1.xlsx", "b2.xlsx"]),
+    ])
+    assert len(issues) == 2
+    assert all(i.code == "DUPLICATE_FILE" for i in issues)
+
+def test_duplicate_files_single_file_group_ignored():
+    # 방어적: 그룹에 파일이 하나뿐이면 중복이 아니다.
+    assert validate_duplicate_files([("hash-a", ["only.xlsx"])]) == []

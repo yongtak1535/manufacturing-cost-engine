@@ -29,6 +29,32 @@ def excel_files(dataset_dir: str | Path) -> list[Path]:
     )
 
 
+def duplicate_file_groups(
+    dataset_dir: str | Path,
+) -> list[tuple[str, list[str]]]:
+    """
+    로딩 대상 Excel 파일들을 SHA-256으로 비교해 내용이 동일한 파일 그룹을 찾는다.
+    파일명이 같은지가 아니라 파일 내용(해시)이 같은지로만 판정한다.
+
+    파일 시스템 접근은 이 loader 계층에서 끝내고, validation 계층에는 순수한
+    (해시, 파일명 목록) 데이터만 넘긴다.
+
+    Returns:
+        [(sha256, [파일명, ...]), ...] — 같은 해시를 가진 파일이 2개 이상인 그룹만,
+        해시 기준으로 정렬해서 반환한다(결정적 순서).
+    """
+    by_hash: dict[str, list[str]] = {}
+
+    for path in excel_files(dataset_dir):
+        by_hash.setdefault(file_sha256(path), []).append(path.name)
+
+    return sorted(
+        (file_hash, sorted(names))
+        for file_hash, names in by_hash.items()
+        if len(names) > 1
+    )
+
+
 def load_workbook(path: Path) -> dict[str, pd.DataFrame]:
     return pd.read_excel(
         path,

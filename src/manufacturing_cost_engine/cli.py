@@ -3,13 +3,13 @@ import argparse
 from pathlib import Path
 from collections import Counter
 
-from .loader import load_dataset
+from .loader import load_dataset, duplicate_file_groups
 from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version, validate_labor_hours
+    validate_bom_version, validate_labor_hours, validate_duplicate_files
 )
 from .cost_engine import calculate_actual_total_cost_by_wo
 
@@ -25,6 +25,7 @@ def main():
         return data.get(f"{file}::{sheet}", [])
 
     issues = []
+    issues += validate_duplicate_files(duplicate_file_groups(root))
     issues += validate_period_rows(rows("02_period.xlsx", "period"))
 
     products = rows("07_product_master.xlsx", "product")

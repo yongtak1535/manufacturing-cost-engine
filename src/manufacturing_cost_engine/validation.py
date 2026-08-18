@@ -1190,3 +1190,29 @@ def validate_labor_hours(work_orders, labor_transactions, production_outputs,
             ))
 
     return issues
+
+def validate_duplicate_files(duplicate_groups):
+    """
+    내용(SHA-256)이 동일한 Excel 파일이 여러 개 적재 대상에 존재하면 보고한다.
+
+    파일 시스템 접근은 loader.duplicate_file_groups()가 담당하고, 이 함수는 그
+    결과인 [(sha256, [파일명, ...]), ...]만 받아 ValidationIssue로 변환한다 —
+    다른 validate_* 함수들과 마찬가지로 순수 데이터만 다룬다.
+
+    중복 파일 하나당이 아니라 동일 내용 그룹당 1건을 보고한다.
+    이 단계에서는 적재를 거부하지 않고 보고만 한다(기존 validator들과 동일하게
+    검출된 문제를 차단하지 않고 리포트하는 방식을 유지).
+    """
+    issues = []
+
+    for file_hash, file_names in duplicate_groups:
+        if len(file_names) <= 1:
+            continue
+        issues.append(_issue(
+            "DUPLICATE_FILE", "WARNING", file_names[0], None, None,
+            f"내용이 동일한 파일 {len(file_names)}건: {', '.join(file_names)} "
+            f"(sha256={file_hash})",
+            file_hash
+        ))
+
+    return issues
