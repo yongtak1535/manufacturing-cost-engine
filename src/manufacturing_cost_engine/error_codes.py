@@ -48,4 +48,15 @@ REVIEW = {
     "REWORK_REVIEW_REQUIRED",
 }
 
-ALL_CODES = CRITICAL | ERROR | WARNING | REVIEW
+# 분모(생산량)가 없어 단위원가를 계산할 수 없는 경우. 0%/0원 등 임의값을 반환하지 않는다.
+NOT_CALCULABLE = {
+    "NO_PRODUCTION_OUTPUT",
+    "ZERO_DENOMINATOR",
+}
+
+# 배부 근거(overhead_rate)가 없어 OH를 배부하지 않는 경우. 다른 CC 요율을 대신 쓰지 않는다.
+NOT_ALLOCATED = {
+    "OVERHEAD_NOT_ALLOCATED",
+}
+
+ALL_CODES = CRITICAL | ERROR | WARNING | REVIEW | NOT_CALCULABLE | NOT_ALLOCATED

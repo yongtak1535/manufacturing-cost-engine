@@ -1,7 +1,7 @@
 from manufacturing_cost_engine.validation import (
     validate_period_rows, validate_gl_balance, validate_material_issues,
     validate_bom_issues, validate_routing, validate_account_mapping,
-    validate_standard_cost
+    validate_standard_cost, validate_actual_cost
 )
 
 def test_period_key_consistency():
@@ -673,3 +673,61 @@ def test_standard_cost_ga_not_required_for_completeness():
         [],
     )
     assert not any(i.code == "STANDARD_COST_MISSING" for i in issues)
+
+
+def _po(wo_no="WO-1", good_qty="10", source_row=2):
+    return {"wo_no": wo_no, "good_qty": good_qty, "_source_row": source_row}
+
+def _labor_tx(wo_no="WO-1", direct_indirect="DIRECT", work_center_code="WC-20"):
+    return {
+        "wo_no": wo_no, "direct_indirect": direct_indirect,
+        "work_center_code": work_center_code,
+    }
+
+def _oh_rate(period_key="2026-07", cost_center_code="CC-100", rate_per_base="18000"):
+    return {
+        "period_key": period_key, "cost_center_code": cost_center_code,
+        "rate_per_base": rate_per_base,
+    }
+
+def test_actual_cost_normal_wo_no_issue():
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")],
+        [_po(wo_no="WO-1", good_qty="10")],
+        [_labor_tx(wo_no="WO-1", work_center_code="WC-20")],
+        [_work_center("WC-20", "선삭", "CC-100")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+    )
+    assert issues == []
+
+def test_actual_cost_no_production_output():
+    # 실제 WO-2607-017과 동일한 케이스: 산출 실적이 전혀 없음.
+    issues = validate_actual_cost([_wo(wo_no="WO-1")], [], [], [], [])
+    assert any(
+        i.code == "NO_PRODUCTION_OUTPUT" and i.severity == "NOT_CALCULABLE"
+        for i in issues
+    )
+
+def test_actual_cost_zero_good_qty():
+    # 실제 WO-2607-009과 동일한 케이스: good_qty=0.
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")], [_po(wo_no="WO-1", good_qty="0")], [], [], []
+    )
+    assert any(
+        i.code == "ZERO_DENOMINATOR" and i.severity == "NOT_CALCULABLE"
+        for i in issues
+    )
+
+def test_actual_cost_overhead_not_allocated():
+    # 실제 CC-300과 동일한 케이스: 해당 cost_center에 overhead_rate가 없음.
+    issues = validate_actual_cost(
+        [_wo(wo_no="WO-1")],
+        [_po(wo_no="WO-1", good_qty="10")],
+        [_labor_tx(wo_no="WO-1", work_center_code="WC-50")],
+        [_work_center("WC-50", "검사", "CC-300")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+    )
+    assert any(
+        i.code == "OVERHEAD_NOT_ALLOCATED" and i.severity == "NOT_ALLOCATED"
+        for i in issues
+    )

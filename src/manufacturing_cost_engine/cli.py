@@ -7,8 +7,9 @@ from .loader import load_dataset
 from .validation import (
     validate_period_rows, validate_work_orders, validate_material_issues,
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
-    validate_standard_cost
+    validate_standard_cost, validate_actual_cost
 )
+from .cost_engine import calculate_actual_total_cost_by_wo
 
 def main():
     parser = argparse.ArgumentParser()
@@ -90,10 +91,35 @@ def main():
         rows("08_material_master.xlsx", "material"),
     )
 
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    production_outputs = rows("21_production_output.xlsx", "production_output")
+    work_centers = rows("09_work_center.xlsx", "work_center")
+    overhead_rates = rows("13_overhead_rate.xlsx", "overhead_rate")
+
+    issues += validate_actual_cost(
+        work_orders, production_outputs, labor_rows, work_centers, overhead_rates,
+    )
+
+    actual_cost_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        labor_rows,
+        rows("08_material_master.xlsx", "material"),
+        work_centers,
+        overhead_rates,
+        products,
+    )
+
     print(f"Loaded sheets: {len(data)}")
     print(f"Validation issues: {len(issues)}")
     for code, count in Counter(i.code for i in issues).most_common():
         print(f"  {code}: {count}")
+
+    print(f"Actual Cost calculated for {len(actual_cost_by_wo)} work order(s)")
+    total_actual_cost = sum(
+        (v["total_cost"] for v in actual_cost_by_wo.values()), start=0
+    )
+    print(f"  Total Actual Cost (all WOs): {total_actual_cost}")
 
 if __name__ == "__main__":
     main()

@@ -664,3 +664,86 @@ def validate_standard_cost(standard_cost_header, standard_cost_detail, products,
         ))
 
     return issues
+
+def validate_actual_cost(work_orders, production_outputs, labor_transactions,
+                         work_centers, overhead_rates):
+    """
+    Actual Cost 계산 자체가 아니라, 계산이 불가능하거나(NOT_CALCULABLE) 배부가
+    되지 않는(NOT_ALLOCATED) 케이스를 보고한다. 실제 DM/DL/OH 금액 계산은
+    cost_engine.calculate_actual_*() 쪽 책임이며 여기서는 재계산하지 않는다.
+
+    - 산출 실적(production_output)이 전혀 없는 WO -> NO_PRODUCTION_OUTPUT
+    - good_qty 합계가 0인 WO -> ZERO_DENOMINATOR (0%/0원 등 임의값 반환 금지)
+    - DIRECT labor가 발생한 (period, cost_center)에 overhead_rate가 없으면
+      -> OVERHEAD_NOT_ALLOCATED (임의로 다른 CC 요율을 대신 적용하지 않음)
+    """
+    issues = []
+
+    good_qty_by_wo = {}
+    has_output_row = set()
+    for po in production_outputs:
+        wo_no = po.get("wo_no")
+        if wo_no is None:
+            continue
+        has_output_row.add(wo_no)
+        qty = _to_decimal(po.get("good_qty"))
+        if qty is None:
+            continue
+        good_qty_by_wo[wo_no] = good_qty_by_wo.get(wo_no, Decimal("0")) + qty
+
+    for wo in work_orders:
+        wo_no = wo.get("wo_no")
+        if wo_no is None:
+            continue
+
+        if wo_no not in has_output_row:
+            issues.append(_issue(
+                "NO_PRODUCTION_OUTPUT", "NOT_CALCULABLE", "21_production_output.xlsx",
+                "production_output", wo.get("_source_row"),
+                f"WO={wo_no}: 산출 실적이 없어 단위원가를 계산할 수 없습니다.", wo_no
+            ))
+            continue
+
+        if good_qty_by_wo.get(wo_no, Decimal("0")) == 0:
+            issues.append(_issue(
+                "ZERO_DENOMINATOR", "NOT_CALCULABLE", "21_production_output.xlsx",
+                "production_output", wo.get("_source_row"),
+                f"WO={wo_no}: good_qty 합계가 0이라 단위원가를 계산할 수 없습니다.", wo_no
+            ))
+
+    work_center_to_cc = {
+        wc.get("work_center_code"): wc.get("cost_center_code")
+        for wc in work_centers if wc.get("work_center_code")
+    }
+    rate_keys = {
+        (r.get("period_key"), r.get("cost_center_code")) for r in overhead_rates
+    }
+    wo_period = {w.get("wo_no"): w.get("period_key") for w in work_orders}
+
+    reported = set()
+    for r in labor_transactions:
+        if r.get("direct_indirect") != "DIRECT":
+            continue
+        wo_no = r.get("wo_no")
+        if wo_no not in wo_period:
+            continue
+
+        cost_center_code = work_center_to_cc.get(r.get("work_center_code"))
+        if cost_center_code is None:
+            continue
+
+        period_key = wo_period.get(wo_no)
+        key = (period_key, cost_center_code)
+        if key in rate_keys or key in reported:
+            continue
+        reported.add(key)
+
+        issues.append(_issue(
+            "OVERHEAD_NOT_ALLOCATED", "NOT_ALLOCATED", "13_overhead_rate.xlsx",
+            "overhead_rate", None,
+            f"cost_center={cost_center_code}, period={period_key}: "
+            f"overhead_rate가 없어 OH가 배부되지 않습니다.",
+            cost_center_code
+        ))
+
+    return issues
