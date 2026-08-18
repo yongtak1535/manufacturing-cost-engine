@@ -1,6 +1,6 @@
 from manufacturing_cost_engine.validation import (
     validate_period_rows, validate_gl_balance, validate_material_issues,
-    validate_bom_issues, validate_routing
+    validate_bom_issues, validate_routing, validate_account_mapping
 )
 
 def test_period_key_consistency():
@@ -380,3 +380,119 @@ def test_routing_operation_seq_must_be_a_whole_number():
         [_work_center()],
     )
     assert any(i.code == "INVALID_ROUTING_OPERATION_SEQ" for i in issues)
+
+
+def _gl_line(company_code="HB01", document_no="GL-1", line_no=1,
+             gl_account_code="51100", debit="100000", credit="0",
+             cost_center_code=None, source_row=2):
+    return {
+        "company_code": company_code, "period_key": "2026-07",
+        "document_no": document_no, "line_no": line_no,
+        "posting_date": "2026-07-31", "gl_account_code": gl_account_code,
+        "debit": debit, "credit": credit, "cost_center_code": cost_center_code,
+        "_source_row": source_row,
+    }
+
+def _account_mapping(company_code="HB01", gl_account_code="51100",
+                      cost_center_code=None, cost_element_code="DM", priority=10):
+    return {
+        "company_code": company_code, "gl_account_code": gl_account_code,
+        "cost_center_code": cost_center_code, "cost_element_code": cost_element_code,
+        "priority": priority,
+    }
+
+def test_account_mapping_normal_no_issue():
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="51100", debit="100000")],
+        [_account_mapping(gl_account_code="51100")],
+    )
+    assert issues == []
+
+def test_account_mapping_cost_center_specific_wins_at_same_priority():
+    # 동일 priority에서는 cost_center_code가 NULL이 아닌 쪽을 우선한다 -> 모호하지 않다.
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="60000", debit="1000", cost_center_code="CC-100")],
+        [
+            _account_mapping(gl_account_code="60000", cost_center_code="CC-100",
+                              cost_element_code="OH", priority=10),
+            _account_mapping(gl_account_code="60000", cost_center_code=None,
+                              cost_element_code="DM", priority=10),
+        ],
+    )
+    assert issues == []
+
+def test_account_mapping_selects_highest_priority():
+    # 실제 데이터의 53100(CC-100 priority=20 vs 전역 priority=10)과 동일한 구조.
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="53100", debit="90000", cost_center_code="CC-100")],
+        [
+            _account_mapping(gl_account_code="53100", cost_center_code="CC-100",
+                              cost_element_code="OH", priority=20),
+            _account_mapping(gl_account_code="53100", cost_center_code=None,
+                              cost_element_code="OH", priority=10),
+        ],
+    )
+    assert issues == []
+
+def test_account_mapping_unmapped_gl():
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="53900", debit="30000")],
+        [_account_mapping(gl_account_code="51100")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UNMAPPED_GL"
+    assert issues[0].severity == "WARNING"
+
+def test_account_mapping_ambiguous():
+    # 실제 데이터의 53500(전역, 동일 priority, 서로 다른 cost_element)과 동일한 구조.
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="53500", debit="25000", cost_center_code=None)],
+        [
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="OH", priority=10),
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="DM", priority=10),
+        ],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "MAPPING_AMBIGUOUS"
+    assert issues[0].severity == "REVIEW_REQUIRED"
+
+def test_account_mapping_excludes_credit_only_lines():
+    # 대변(credit)만 있는 라인(예: 25100 원재료 상계)은 애초에 분류 대상이 아니다.
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="25100", debit="0", credit="100000")],
+        [],
+    )
+    assert issues == []
+
+def test_account_mapping_clear_priority_normal_selection():
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="70000", debit="500", cost_center_code="CC-900")],
+        [
+            _account_mapping(gl_account_code="70000", cost_center_code=None,
+                              cost_element_code="OH", priority=5),
+            _account_mapping(gl_account_code="70000", cost_center_code=None,
+                              cost_element_code="GA", priority=10),
+        ],
+    )
+    assert issues == []
+
+def test_account_mapping_different_company_code_excluded():
+    # 매핑이 다른 company_code에 대해서만 존재하면 후보에서 제외되어 UNMAPPED로 처리된다.
+    issues = validate_account_mapping(
+        [_gl_line(company_code="HB01", gl_account_code="51100", debit="1000")],
+        [_account_mapping(company_code="HB02", gl_account_code="51100")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UNMAPPED_GL"
+
+def test_account_mapping_excludes_lines_with_both_debit_and_credit():
+    # 실제 GL-260731-017(E-029 차대불균형)처럼 debit>0이면서 credit도 채워진 라인은
+    # "소비 대체분개"의 순수 차변 라인이 아니므로 매핑 대상에서 제외한다.
+    # (매핑되지 않은 계정이라도 UNMAPPED_GL을 만들지 않아야 한다.)
+    issues = validate_account_mapping(
+        [_gl_line(gl_account_code="25100", debit="500", credit="10000")],
+        [],
+    )
+    assert issues == []

@@ -439,3 +439,81 @@ def validate_routing(work_orders, routing_versions, routing_operations, work_cen
     )
 
     return issues
+
+def _index_account_mappings(account_mappings):
+    """company_code -> gl_account_code -> [account_mapping rows]"""
+    index = defaultdict(lambda: defaultdict(list))
+    for m in account_mappings:
+        company_code = m.get("company_code")
+        gl_account_code = m.get("gl_account_code")
+        if company_code is None or gl_account_code is None:
+            continue
+        index[company_code][gl_account_code].append(m)
+    return index
+
+def _mapping_priority(mapping_row):
+    priority = _to_decimal(mapping_row.get("priority"))
+    return priority if priority is not None else Decimal("-Infinity")
+
+def validate_account_mapping(gl_transactions, account_mappings,
+                             file="24_gl_transaction.xlsx", sheet="gl_transaction"):
+    """
+    Phase 1 cost element classification 규칙 (일반 회계원칙이 아니라 이 데이터셋 전용 규칙):
+    24_gl_transaction.xlsx는 "소비 대체분개" 구조라 차변(debit)이 실제 원가 발생,
+    대변(credit)은 원재료 등 대차대조표 상계 계정이다. 따라서 순수 차변 라인
+    (debit > 0 이고 credit == 0)만 account_mapping을 통해 cost_element로 분류하고,
+    credit 라인은 대상에서 제외한다. debit/credit이 둘 다 채워진 라인(예: 차대불균형
+    오류가 섞인 행)은 이 분류 대상이 아니며 GL_UNBALANCED_DOCUMENT 등 별도 검증이 다룬다.
+
+    후보 = company_code + gl_account_code 일치 AND
+           (mapping.cost_center_code == gl.cost_center_code OR mapping.cost_center_code IS NULL)
+    선택 = priority DESC, 동일 priority면 cost_center_code가 NULL이 아닌 쪽 우선
+    0건 -> UNMAPPED_GL(WARNING), 최종 동순위 후보 2개 이상 -> MAPPING_AMBIGUOUS(REVIEW_REQUIRED)
+    """
+    issues = []
+    mapping_index = _index_account_mappings(account_mappings)
+
+    for r in gl_transactions:
+        debit = _to_decimal(r.get("debit"))
+        credit = _to_decimal(r.get("credit"))
+        if debit is None or debit <= 0:
+            continue
+        if credit is not None and credit != 0:
+            continue
+
+        company_code = r.get("company_code")
+        gl_account_code = r.get("gl_account_code")
+        cost_center_code = r.get("cost_center_code")
+        row = r.get("_source_row")
+
+        candidates = [
+            m for m in mapping_index.get(company_code, {}).get(gl_account_code, [])
+            if m.get("cost_center_code") == cost_center_code
+            or m.get("cost_center_code") is None
+        ]
+
+        if not candidates:
+            issues.append(_issue(
+                "UNMAPPED_GL", "WARNING", file, sheet, row,
+                f"매핑 없음: company_code={company_code}, gl_account_code={gl_account_code}",
+                gl_account_code
+            ))
+            continue
+
+        top_priority = max(_mapping_priority(m) for m in candidates)
+        top_candidates = [m for m in candidates if _mapping_priority(m) == top_priority]
+
+        if any(m.get("cost_center_code") is not None for m in top_candidates):
+            top_candidates = [
+                m for m in top_candidates if m.get("cost_center_code") is not None
+            ]
+
+        if len(top_candidates) > 1:
+            issues.append(_issue(
+                "MAPPING_AMBIGUOUS", "REVIEW_REQUIRED", file, sheet, row,
+                f"동순위 매핑 {len(top_candidates)}건: company_code={company_code}, "
+                f"gl_account_code={gl_account_code}, priority={top_priority}",
+                gl_account_code
+            ))
+
+    return issues
