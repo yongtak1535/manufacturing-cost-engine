@@ -28,6 +28,7 @@ from manufacturing_cost_engine.cost_engine import (
     resolve_ga_ceiling_rate,
     calculate_regulatory_ga_by_contract,
     calculate_government_furnished_material_by_contract,
+    calculate_actual_material_cost_excluding_gfm_by_contract,
 )
 
 
@@ -108,10 +109,10 @@ def _material(material_code="MAT-001"):
     return {"material_code": material_code}
 
 def _issue(wo_no="WO-1", material_code="MAT-001", issued_qty="10",
-           unit_cost="100", issue_type="ISSUE"):
+           unit_cost="100", issue_type="ISSUE", supply_type=None):
     return {
         "wo_no": wo_no, "material_code": material_code, "issued_qty": issued_qty,
-        "unit_cost": unit_cost, "issue_type": issue_type,
+        "unit_cost": unit_cost, "issue_type": issue_type, "supply_type": supply_type,
     }
 
 def _labor(wo_no="WO-1", actual_hours="1", actual_rate="24000", amount="24000",
@@ -213,6 +214,354 @@ def test_actual_material_cost_excludes_unparseable_quantity():
         [_product()],
     )
     assert result == {}
+
+
+# --- GFM/DM 정합성 검증 (Phase 2 9단계 후속) ---
+#
+# 목표: material_issue.supply_type으로 관급재료비(GFM)/사급재료비를 나눴을 때
+# 기존 calculate_actual_material_cost()(보호 함수, 이 구획에서도 절대
+# 수정하지 않는다)와의 관계를 명확히 한다. 아래 supply_type 값은 전부
+# 합성 테스트 픽스처이며 실제 방산원가 데이터가 아니다.
+
+def test_actual_material_cost_ignores_supply_type_includes_everything():
+    # 현재 DM 집계는 supply_type을 전혀 참조하지 않는다 — GOVERNMENT/COMPANY
+    # 태그와 무관하게 issued_qty x unit_cost를 모두 더한다. 즉 이 함수의
+    # 결과는 "사급재료비만"이 아니라 "관급+사급을 합친 총 재료비"다.
+    result = calculate_actual_material_cost(
+        [_wo()],
+        [
+            _issue(issued_qty="10", unit_cost="100", supply_type="GOVERNMENT"),
+            _issue(issued_qty="5", unit_cost="200", supply_type="COMPANY"),
+        ],
+        [_material()],
+        [_product()],
+    )
+    government_only = Decimal("1000.00")  # 10 x 100
+    company_only = Decimal("1000.00")     # 5 x 200
+
+    assert result == {"WO-1": Decimal("2000.00")}
+    assert result["WO-1"] == government_only + company_only
+    # 핵심 확인: 기존 함수의 결과는 "사급재료비만"의 값과 다르다.
+    assert result["WO-1"] != company_only
+
+def test_gfm_function_isolates_government_amount_from_same_synthetic_split():
+    # 위 테스트와 동일한 관급/사급 구성을 신규 GFM 함수에 넣으면 관급분만
+    # 정확히 분리된다.
+    result = calculate_government_furnished_material_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [{"wo_no": "WO-1", "contract_no": "CONTRACT-A"}],
+        [
+            _issue(issued_qty="10", unit_cost="100", supply_type="GOVERNMENT"),
+            _issue(issued_qty="5", unit_cost="200", supply_type="COMPANY"),
+        ],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is True
+    assert entry["gfm_amount"] == Decimal("1000.00")
+
+def test_dm_component_already_contains_gfm_naive_addition_would_double_count():
+    # calculate_actual_total_cost_by_contract()의 actual_material_cost는
+    # calculate_actual_material_cost()를 그대로 재사용하므로, GOVERNMENT
+    # 태그 재료비까지 이미 포함하고 있다. 따라서 이 값에
+    # calculate_government_furnished_material_by_contract()의 gfm_amount를
+    # 그대로 더하면 GOVERNMENT 금액이 두 번 계산된다 — 현재 어떤 함수도
+    # 이렇게 더하도록 연결되어 있지는 않지만(코드 결합 없음, 별도 확인),
+    # 향후 "제조원가(관급재료비 포함)" 공식을 구현할 때 이 함정을 피해야
+    # 한다는 것을 명시적으로 확인해 둔다.
+    work_orders = [
+        {"wo_no": "WO-1", "product_code": "P-100", "period_key": "2026-07",
+         "contract_no": "CONTRACT-A"},
+    ]
+    material_issues = [
+        _issue(wo_no="WO-1", issued_qty="10", unit_cost="100", supply_type="GOVERNMENT"),
+    ]
+
+    actual_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders, material_issues, [], [_material()], [], [], [_product()],
+    )
+    actual_by_contract = calculate_actual_total_cost_by_contract(work_orders, actual_by_wo)
+    dm_component = actual_by_contract["CONTRACT-A"]["actual_material_cost"]
+
+    gfm_by_contract = calculate_government_furnished_material_by_contract(
+        [{"contract_no": "CONTRACT-A"}], work_orders, material_issues,
+    )
+    gfm_amount = gfm_by_contract["CONTRACT-A"]["gfm_amount"]
+
+    assert dm_component == Decimal("1000.00")
+    assert gfm_amount == Decimal("1000.00")
+    # dm_component + gfm_amount는 실제 재료비(1,000.00)의 두 배이며,
+    # 이는 잘못된 계산이라는 것을 확인하기 위한 대조값이다.
+    assert dm_component + gfm_amount == Decimal("2000.00")
+    assert dm_component + gfm_amount != Decimal("1000.00")
+
+def test_none_supply_type_included_in_existing_dm_but_blocks_gfm_calculation():
+    # 미분류(supply_type=None) 행은 기존 DM 함수에는 그대로 포함되지만
+    # (supply_type을 보지 않으므로), 신규 GFM 함수에서는 "계산 불가"로
+    # 처리된다 — 두 함수가 미분류 행을 서로 다르게(그러나 각자 의도된 대로)
+    # 다룬다는 것을 명확히 대조한다.
+    work_orders = [
+        {"wo_no": "WO-1", "product_code": "P-100", "period_key": "2026-07",
+         "contract_no": "CONTRACT-A"},
+    ]
+    material_issues = [
+        _issue(wo_no="WO-1", issued_qty="10", unit_cost="100", supply_type=None),
+    ]
+
+    dm = calculate_actual_material_cost(
+        work_orders, material_issues, [_material()], [_product()],
+    )
+    assert dm == {"WO-1": Decimal("1000.00")}
+
+    gfm = calculate_government_furnished_material_by_contract(
+        [{"contract_no": "CONTRACT-A"}], work_orders, material_issues,
+    )
+    assert gfm["CONTRACT-A"]["calculable"] is False
+    assert gfm["CONTRACT-A"]["gfm_amount"] is None
+    # supply_type=None이 0이나 "COMPANY"로 암묵 처리되지 않았음을 재확인:
+    # 만약 COMPANY로 간주됐다면 calculable=True, gfm_amount=0이 되었을 것이다.
+    assert not (gfm["CONTRACT-A"]["calculable"] is True
+                and gfm["CONTRACT-A"]["gfm_amount"] == Decimal("0"))
+
+def test_real_dataset_actual_material_cost_unaffected_by_blank_supply_type_column():
+    # supply_type 컬럼이 22_material_issue.xlsx에 추가되었지만 전부 None이므로,
+    # 기존 calculate_actual_material_cost() 결과는 이전과 동일해야 한다 —
+    # 이 함수는 supply_type을 아예 보지 않기 때문이다(회귀 없음의 직접 증거).
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return
+
+    data = load_dataset(dataset)
+    work_orders = data["20_work_order.xlsx::work_order"]
+    material_issues = data["22_material_issue.xlsx::material_issue"]
+    materials = data["08_material_master.xlsx::material"]
+    products = data["07_product_master.xlsx::product"]
+
+    assert all(r.get("supply_type") is None for r in material_issues)
+
+    result = calculate_actual_material_cost(work_orders, material_issues, materials, products)
+    # 기존(이전 라운드에서부터 계속 유지된) 실제 DM 실적 — CLI 출력과
+    # 대사되는 CONTRACT-001의 work order 중 하나인 WO-2607-004의 DM 실적.
+    # supply_type 컬럼 추가 여부와 무관하게 이 값은 변하지 않아야 한다.
+    assert "WO-2607-004" in result
+    assert result["WO-2607-004"] is not None
+
+
+# --- calculate_actual_material_cost_excluding_gfm_by_contract ---
+#
+# calculate_actual_material_cost()(보호 함수, 수정하지 않음)와 나란히 존재
+# 하는 "관급재료비 제외" 계약 단위 재료비 집계. 아래 supply_type 값은 전부
+# 합성 테스트 픽스처이며 실제 방산원가 데이터가 아니다.
+
+def _dm_excl_wo(wo_no="WO-1", contract_no="CONTRACT-A"):
+    return {"wo_no": wo_no, "contract_no": contract_no}
+
+def test_dm_excl_gfm_company_only():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A")],
+        [_issue("WO-1", issued_qty="10", unit_cost="100", supply_type="COMPANY")],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is True
+    assert entry["dm_excluding_gfm"] == Decimal("1000.00")
+    assert entry["company_issue_count"] == 1
+
+def test_dm_excl_gfm_government_only_is_excluded_leaving_zero():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A")],
+        [_issue("WO-1", issued_qty="10", unit_cost="100", supply_type="GOVERNMENT")],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is True
+    assert entry["dm_excluding_gfm"] == Decimal("0")
+    assert entry["company_issue_count"] == 0
+
+def test_dm_excl_gfm_mixed_company_and_government():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A")],
+        [
+            _issue("WO-1", issued_qty="10", unit_cost="100", supply_type="GOVERNMENT"),
+            _issue("WO-1", issued_qty="5", unit_cost="200", supply_type="COMPANY"),
+        ],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is True
+    assert entry["dm_excluding_gfm"] == Decimal("1000.00")  # COMPANY(5x200)만
+
+def test_dm_excl_gfm_untagged_row_makes_contract_not_calculable():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A")],
+        [_issue("WO-1", issued_qty="10", unit_cost="100", supply_type=None)],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is False
+    assert entry["dm_excluding_gfm"] is None
+    assert entry["untagged_issue_count"] == 1
+
+def test_dm_excl_gfm_zero_amount_is_valid_not_a_calculation_failure():
+    # COMPANY로 명확히 분류됐지만 금액이 0인 경우(예: 환입으로 정확히
+    # 상쇄)는 계산 불가가 아니라 정상적으로 계산된 0이다.
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A")],
+        [
+            _issue("WO-1", issued_qty="10", unit_cost="100", issue_type="ISSUE",
+                   supply_type="COMPANY"),
+            _issue("WO-1", issued_qty="10", unit_cost="100", issue_type="RETURN",
+                   supply_type="COMPANY"),
+        ],
+    )
+    entry = result["CONTRACT-A"]
+    assert entry["calculable"] is True
+    assert entry["dm_excluding_gfm"] == Decimal("0.00")
+
+def test_dm_excl_gfm_aggregates_per_contract_separately():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}, {"contract_no": "CONTRACT-B"}],
+        [_dm_excl_wo("WO-1", "CONTRACT-A"), _dm_excl_wo("WO-2", "CONTRACT-B")],
+        [
+            _issue("WO-1", issued_qty="10", unit_cost="100", supply_type="COMPANY"),
+            _issue("WO-2", issued_qty="3", unit_cost="50", supply_type="COMPANY"),
+        ],
+    )
+    assert result["CONTRACT-A"]["dm_excluding_gfm"] == Decimal("1000.00")
+    assert result["CONTRACT-B"]["dm_excluding_gfm"] == Decimal("150.00")
+
+def test_dm_excl_gfm_plus_gfm_equals_total_material_cost_no_double_counting():
+    # 모든 행이 분류되어 있을 때(미분류 없음), 신규 함수(사급만) + 기존 GFM
+    # 함수(관급만)의 합은 그 계약에 귀속되는 material_issue 전체 순액과
+    # 정확히 일치해야 한다 — 이중집계도, 누락도 없어야 한다.
+    contracts = [{"contract_no": "CONTRACT-A"}]
+    work_orders = [_dm_excl_wo("WO-1", "CONTRACT-A")]
+    material_issues = [
+        _issue("WO-1", issued_qty="10", unit_cost="100", issue_type="ISSUE",
+               supply_type="GOVERNMENT"),
+        _issue("WO-1", issued_qty="3", unit_cost="100", issue_type="RETURN",
+               supply_type="GOVERNMENT"),
+        _issue("WO-1", issued_qty="5", unit_cost="200", issue_type="ISSUE",
+               supply_type="COMPANY"),
+    ]
+
+    dm_excl = calculate_actual_material_cost_excluding_gfm_by_contract(
+        contracts, work_orders, material_issues,
+    )["CONTRACT-A"]["dm_excluding_gfm"]
+    gfm = calculate_government_furnished_material_by_contract(
+        contracts, work_orders, material_issues,
+    )["CONTRACT-A"]["gfm_amount"]
+
+    # 전체 순액을 별도로 직접 계산(기존 calculate_actual_material_cost()를
+    # 그대로 호출해 검증 기준으로 사용 — 보호 함수를 수정하지 않고 호출만 함).
+    total_material_cost = calculate_actual_material_cost(
+        [{"wo_no": "WO-1", "product_code": "P-100", "period_key": "2026-07"}],
+        material_issues,
+        [_material()],
+        [_product()],
+    )["WO-1"]
+
+    assert dm_excl == Decimal("1000.00")  # COMPANY: 5 x 200
+    assert gfm == Decimal("700.00")       # GOVERNMENT 순액: (10-3) x 100
+    assert dm_excl + gfm == total_material_cost
+    assert total_material_cost == Decimal("1700.00")  # 1000(COMPANY) + 700(GOV)
+
+def test_dm_excl_gfm_seeds_all_contracts_from_master():
+    result = calculate_actual_material_cost_excluding_gfm_by_contract(
+        [{"contract_no": "CONTRACT-A"}, {"contract_no": "CONTRACT-EMPTY"}], [], [],
+    )
+    assert set(result.keys()) == {"CONTRACT-A", "CONTRACT-EMPTY"}
+    for entry in result.values():
+        assert entry["calculable"] is True
+        assert entry["dm_excluding_gfm"] == Decimal("0")
+
+def test_dm_excl_gfm_does_not_mutate_inputs():
+    contracts = [{"contract_no": "CONTRACT-A"}]
+    work_orders = [_dm_excl_wo("WO-1", "CONTRACT-A")]
+    material_issues = [_issue("WO-1", supply_type="COMPANY")]
+
+    import copy
+    contracts_before = copy.deepcopy(contracts)
+    work_orders_before = copy.deepcopy(work_orders)
+    material_issues_before = copy.deepcopy(material_issues)
+
+    calculate_actual_material_cost_excluding_gfm_by_contract(
+        contracts, work_orders, material_issues,
+    )
+
+    assert contracts == contracts_before
+    assert work_orders == work_orders_before
+    assert material_issues == material_issues_before
+
+def test_dm_excl_gfm_not_wired_into_regulatory_ga_by_contract():
+    # calculate_regulatory_ga_by_contract()는 government_furnished_material_
+    # by_contract와 dm_excluding_gfm_by_contract를 둘 다 "외부에서 이미 계산된
+    # dict"로만 받는다 — 함수 내부에서
+    # calculate_government_furnished_material_by_contract()나
+    # calculate_actual_material_cost_excluding_gfm_by_contract()를 직접
+    # 호출해 몰래 계산해주지 않는다는 것을 확인한다(호출자가 반드시 둘 다
+    # 명시적으로 구해서 넘겨야 한다).
+    result = calculate_regulatory_ga_by_contract(
+        {"CONTRACT-A": {"actual_manufacturing_cost": Decimal("1000000.00")}},
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("2000000.00")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {},  # government_furnished_material_by_contract: 여전히 외부에서 받는 빈 dict
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "INCLUDE_GFM",
+        _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
+    )
+    c = result["CONTRACT-A"]
+    # INCLUDE_GFM인데 GFM dict에 이 계약 항목이 없으므로 여전히 계산 불가다 —
+    # dm_excluding_gfm은 정상 제공됐지만 GFM 자체가 없어서 계산 불가가
+    # 된다는 것을 확인한다(GFM과 DM 두 입력이 독립적으로 검사됨을 보임).
+    assert c["calculable"] is False
+    assert c["ga_base_amount_actual"] is None
+
+
+# --- Budget 쪽 GFM 이중집계 여부 확인 ---
+#
+# calculate_standard_budget_by_contract()가 material_issue.supply_type과
+# 무관한 완전히 다른 데이터(12_standard_cost.xlsx의 사전 산정 표준원가)를
+# 쓰기 때문에, Actual 쪽과 동일한 "GFM이 이미 섞여 있다" 문제가 존재하지
+# 않는다는 것을 코드/스키마로 확인한다. 근거가 없으므로 이 구획은 어떤
+# 코드도 수정하지 않는다 — 확인만 한다.
+
+def test_standard_budget_by_contract_does_not_reference_material_issue_or_supply_type():
+    import inspect
+    from manufacturing_cost_engine import cost_engine as ce
+
+    source = inspect.getsource(ce.calculate_standard_budget_by_contract)
+    assert "material_issue" not in source
+    assert "supply_type" not in source
+
+def test_standard_cost_schema_has_no_supply_type_or_gfm_concept():
+    # 12_standard_cost.xlsx는 실제 자재불출 트랜잭션이 아니라 제품 1단위당
+    # 사전 산정된 금액(standard_amount)만 가지고 있어, 관급/사급을 구분할
+    # 데이터 자체가 없다 — Budget 쪽은 "이중집계"가 아니라 "구분 불가능한
+    # 데이터 모델"이라는 다른 종류의 제약이다.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return
+
+    data = load_dataset(dataset)
+    for sheet in ("standard_cost", "standard_cost_detail"):
+        rows = data.get(f"12_standard_cost.xlsx::{sheet}", [])
+        if not rows:
+            continue
+        assert "supply_type" not in rows[0]
 
 
 # --- calculate_actual_labor_cost ---
@@ -2379,6 +2728,17 @@ def _reg_contract(contract_no="CONTRACT-A", contract_type="MULTI_PRODUCT",
         "company_size": company_size,
     }
 
+def _dm_excl_gfm(contract_no="CONTRACT-A", amount="1000000.00"):
+    # calculate_actual_material_cost_excluding_gfm_by_contract()의 출력
+    # 형태를 흉내낸 테스트 픽스처. 기존(파라미터 추가 이전) 테스트들이
+    # actual_by_contract["actual_manufacturing_cost"]에 넣었던 것과 동일한
+    # 값을 그대로 dm_excluding_gfm에 옮겨서, actual_labor_cost/
+    # actual_overhead_cost가 없는(0으로 처리되는) 상황에서 이전과 동일한
+    # 합계가 나오도록 한다.
+    if amount is None:
+        return {contract_no: {"dm_excluding_gfm": None}}
+    return {contract_no: {"dm_excluding_gfm": Decimal(amount)}}
+
 def test_regulatory_ga_no_rate_rule_is_not_calculable_not_zero():
     result = calculate_regulatory_ga_by_contract(
         {"CONTRACT-A": {"actual_manufacturing_cost": Decimal("1000000.00")}},
@@ -2390,6 +2750,7 @@ def test_regulatory_ga_no_rate_rule_is_not_calculable_not_zero():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     assert c["calculable"] is False
@@ -2407,6 +2768,7 @@ def test_regulatory_ga_missing_gfm_under_include_basis_is_not_calculable():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "INCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     assert c["calculable"] is False
@@ -2424,10 +2786,11 @@ def test_regulatory_ga_calculable_with_full_data_exclude_gfm():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     assert c["calculable"] is True
-    # 기준액 = DM+DL+OH(1,000,000.00) + DE(500,000.00) = 1,500,000.00
+    # 기준액 = DM(관급제외, 1,000,000.00)+DL(0)+OH(0) + DE(500,000.00) = 1,500,000.00
     assert c["ga_base_amount_actual"] == Decimal("1500000.00")
     assert c["ga_actual"] == Decimal("120000.00")
 
@@ -2443,6 +2806,7 @@ def test_regulatory_ga_budget_de_not_calculable_makes_budget_base_none():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     # Actual 쪽은 계산되지만 Budget 쪽은 Budget DE가 없어 기준액 자체가 None.
@@ -2469,6 +2833,7 @@ def test_regulatory_ga_exceeds_ceiling_flag_does_not_alter_ga_actual():
                         industry_type="ASSEMBLY_METAL", company_size="GENERAL")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     # 상한(7%)보다 실적요율(12%)이 높다는 것을 인지만 하고, ga_actual 계산에는
@@ -2482,6 +2847,7 @@ def test_regulatory_ga_seeds_all_contracts_from_master():
         [_reg_contract("CONTRACT-A"), _reg_contract("CONTRACT-EMPTY")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        {},
     )
     assert set(result.keys()) == {"CONTRACT-A", "CONTRACT-EMPTY"}
 
@@ -2493,15 +2859,17 @@ def test_regulatory_ga_does_not_mutate_inputs():
     gfm = {}
     rate_rules = [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")]
     contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000000.00")
 
     import copy
     actual_before, budget_before = copy.deepcopy(actual), copy.deepcopy(budget)
     de_actual_before, de_budget_before = copy.deepcopy(de_actual), copy.deepcopy(de_budget)
     rate_rules_before, contracts_before = copy.deepcopy(rate_rules), copy.deepcopy(contracts)
+    dm_excl_before = copy.deepcopy(dm_excl)
 
     calculate_regulatory_ga_by_contract(
         actual, budget, de_actual, de_budget, gfm, rate_rules, contracts, "EXCLUDE_GFM",
-        _REF_DATE,
+        _REF_DATE, dm_excl,
     )
 
     assert actual == actual_before
@@ -2510,6 +2878,7 @@ def test_regulatory_ga_does_not_mutate_inputs():
     assert de_budget == de_budget_before
     assert rate_rules == rate_rules_before
     assert contracts == contracts_before
+    assert dm_excl == dm_excl_before
 
 
 # --- 기존 calculate_ga_by_contract()와의 비교 테스트 ---
@@ -2537,6 +2906,7 @@ def test_regulatory_ga_matches_legacy_ga_when_de_is_zero():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
 
     assert legacy_result["CONTRACT-A"]["ga_actual"] == new_result["CONTRACT-A"]["ga_actual"]
@@ -2566,6 +2936,7 @@ def test_regulatory_ga_diverges_from_legacy_when_de_is_nonzero():
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
 
     legacy_ga = legacy_result["CONTRACT-A"]["ga_actual"]
@@ -2620,11 +2991,17 @@ def _load_real_regulatory_ga():
     rate_rules = rows("32_cost_rate_rule.xlsx", "cost_rate_rule")
     # government_furnished_material_by_contract: 외부 입력, 현재 어떤 계약도 데이터 없음.
     gfm_by_contract = {}
+    # dm_excluding_gfm_by_contract: 실제 material_issue의 supply_type이 전부
+    # None이므로, material_issue가 존재하는 계약은 calculable=False가 된다.
+    dm_excluding_gfm_by_contract = calculate_actual_material_cost_excluding_gfm_by_contract(
+        contracts, work_orders, rows("22_material_issue.xlsx", "material_issue"),
+    )
     # reference_date는 rate_rules가 이미 빈 리스트이므로 어떤 값을 넣어도
     # calculable=False로 남는다 — 실제 GA 적용일을 의미하지 않는 placeholder다.
     return calculate_regulatory_ga_by_contract(
         actual_by_contract, budget_by_contract, actual_de, budget_de,
         gfm_by_contract, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE,
+        dm_excluding_gfm_by_contract,
     )
 
 def test_real_dataset_regulatory_ga_all_contracts_not_calculable():
@@ -2766,11 +3143,15 @@ def test_regulatory_ga_actual_de_zero_vs_entirely_absent_both_treated_as_zero():
     rate_rules = [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")]
     contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
 
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000000.00")
+
     result_explicit = calculate_regulatory_ga_by_contract(
-        *common_args, de_explicit_zero, budget_de, {}, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE,
+        *common_args, de_explicit_zero, budget_de, {}, rate_rules, contracts, "EXCLUDE_GFM",
+        _REF_DATE, dm_excl,
     )
     result_absent = calculate_regulatory_ga_by_contract(
-        *common_args, de_entirely_absent, budget_de, {}, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE,
+        *common_args, de_entirely_absent, budget_de, {}, rate_rules, contracts, "EXCLUDE_GFM",
+        _REF_DATE, dm_excl,
     )
     assert result_explicit["CONTRACT-A"]["ga_base_amount_actual"] == Decimal("1000000.00")
     assert result_absent["CONTRACT-A"]["ga_base_amount_actual"] == Decimal("1000000.00")
@@ -2787,14 +3168,17 @@ def test_regulatory_ga_budget_de_entirely_missing_vs_explicit_not_calculable_bot
     rate_rules = [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")]
     contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
 
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000000.00")
+
     result_missing = calculate_regulatory_ga_by_contract(
         *common_args, {}, {}, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE,  # budget_de dict 자체가 비어있음
+        dm_excl,
     )
     result_explicit_false = calculate_regulatory_ga_by_contract(
         *common_args,
         {"CONTRACT-A": {"calculable": False, "budget_direct_expense": None,
                          "reason": "[TEST FIXTURE] 없음"}},
-        {}, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE,
+        {}, rate_rules, contracts, "EXCLUDE_GFM", _REF_DATE, dm_excl,
     )
     assert result_missing["CONTRACT-A"]["ga_base_amount_budget"] is None
     assert result_explicit_false["CONTRACT-A"]["ga_base_amount_budget"] is None
@@ -2814,6 +3198,7 @@ def test_regulatory_ga_budget_de_calculable_true_with_zero_amount_is_valid_base(
         [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     c = result["CONTRACT-A"]
     assert c["ga_base_amount_budget"] == Decimal("2000000.00")
@@ -2832,11 +3217,14 @@ def test_regulatory_ga_government_furnished_material_zero_vs_missing_under_inclu
     rate_rules = [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")]
     contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
 
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000000.00")
+
     result_zero_gfm = calculate_regulatory_ga_by_contract(
-        *common_args, {"CONTRACT-A": Decimal("0")}, rate_rules, contracts, "INCLUDE_GFM", _REF_DATE,
+        *common_args, {"CONTRACT-A": Decimal("0")}, rate_rules, contracts, "INCLUDE_GFM",
+        _REF_DATE, dm_excl,
     )
     result_missing_gfm = calculate_regulatory_ga_by_contract(
-        *common_args, {}, rate_rules, contracts, "INCLUDE_GFM", _REF_DATE,
+        *common_args, {}, rate_rules, contracts, "INCLUDE_GFM", _REF_DATE, dm_excl,
     )
     assert result_zero_gfm["CONTRACT-A"]["calculable"] is True
     assert result_zero_gfm["CONTRACT-A"]["ga_base_amount_actual"] == Decimal("1000000.00")
@@ -2861,6 +3249,7 @@ def test_regulatory_ga_exceeds_ceiling_is_false_when_actual_rate_within_ceiling(
                         industry_type="ASSEMBLY_METAL", company_size="GENERAL")],
         "EXCLUDE_GFM",
         _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000000.00"),
     )
     assert result["CONTRACT-A"]["exceeds_ceiling"] is False
     assert result["CONTRACT-A"]["ga_actual"] == Decimal("50000.00")
@@ -2874,19 +3263,21 @@ def test_regulatory_ga_uses_shared_reference_date_for_actual_and_budget_rate_loo
                                   rate_pct="8", effective_from="2026-01-01", effective_to="2026-06-30")]
     contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
 
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000000.00")
+
     result_in_range = calculate_regulatory_ga_by_contract(
         {"CONTRACT-A": {"actual_manufacturing_cost": Decimal("1000000.00")}},
         {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("2000000.00")}},
         {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
         {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
-        {}, rate_rules, contracts, "EXCLUDE_GFM", "2026-03-01",
+        {}, rate_rules, contracts, "EXCLUDE_GFM", "2026-03-01", dm_excl,
     )
     result_out_of_range = calculate_regulatory_ga_by_contract(
         {"CONTRACT-A": {"actual_manufacturing_cost": Decimal("1000000.00")}},
         {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("2000000.00")}},
         {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
         {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
-        {}, rate_rules, contracts, "EXCLUDE_GFM", "2026-09-01",
+        {}, rate_rules, contracts, "EXCLUDE_GFM", "2026-09-01", dm_excl,
     )
     assert result_in_range["CONTRACT-A"]["calculable"] is True
     assert result_in_range["CONTRACT-A"]["ga_actual"] == Decimal("80000.00")
@@ -2894,6 +3285,185 @@ def test_regulatory_ga_uses_shared_reference_date_for_actual_and_budget_rate_loo
     assert result_out_of_range["CONTRACT-A"]["calculable"] is False
     assert result_out_of_range["CONTRACT-A"]["ga_actual"] is None
     assert result_out_of_range["CONTRACT-A"]["ga_budget"] is None
+
+
+# --- calculate_regulatory_ga_by_contract: dm_excluding_gfm_by_contract 연결 ---
+#
+# 이 구획은 신설한 dm_excluding_gfm_by_contract 파라미터가 오케스트레이터
+# 안에서 실제로 이중집계 없이 동작하는지, GFM/DM 계산이 서로 올바르게
+# 분리·재조합되는지를 검증한다. 아래 금액은 전부 합성 테스트 픽스처다.
+
+def test_regulatory_ga_gfm_excluded_from_actual_base_when_company_and_government_mixed():
+    # DM excluding GFM(=COMPANY만, 1000) + DL(200) + OH(300) + DE(100) = 1600.
+    # EXCLUDE_GFM 기준에서는 GFM(500)이 전혀 더해지지 않아야 한다 — 관급재료비가
+    # 섞여 있어도(별도 government_furnished_material_by_contract로 존재)
+    # Actual 기준액에서 제외된 상태를 유지해야 한다.
+    actual_by_contract = {
+        "CONTRACT-A": {"actual_labor_cost": Decimal("200"), "actual_overhead_cost": Decimal("300")},
+    }
+    result = calculate_regulatory_ga_by_contract(
+        actual_by_contract,
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("0")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("100")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {"CONTRACT-A": Decimal("500")},  # government_furnished_material_by_contract
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="10")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "EXCLUDE_GFM",
+        _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000"),
+    )
+    c = result["CONTRACT-A"]
+    assert c["manufacturing_cost_excluding_government_material_actual"] == Decimal("1600")
+    assert c["ga_base_amount_actual"] == Decimal("1600")  # 500(GFM)이 포함되지 않음
+
+def test_regulatory_ga_include_gfm_adds_gfm_exactly_once_no_double_counting():
+    # 같은 구성에서 INCLUDE_GFM이면 GFM(500)이 정확히 한 번만 더해져야 한다
+    # (1600 + 500 = 2100) — dm_excluding_gfm이 이미 관급재료비를 제외한
+    # 값이므로, 관급분이 이미 섞여 있는 상태에서 또 더하는 이중집계가
+    # 일어나지 않는다는 것을 오케스트레이터 수준에서 확인한다.
+    actual_by_contract = {
+        "CONTRACT-A": {"actual_labor_cost": Decimal("200"), "actual_overhead_cost": Decimal("300")},
+    }
+    result = calculate_regulatory_ga_by_contract(
+        actual_by_contract,
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("0")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("100")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {"CONTRACT-A": Decimal("500")},
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="10")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "INCLUDE_GFM",
+        _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000"),
+    )
+    c = result["CONTRACT-A"]
+    assert c["ga_base_amount_actual"] == Decimal("2100")  # 1600 + 500, 딱 한 번만 더해짐
+
+def test_regulatory_ga_dm_excluding_gfm_and_gfm_reconstruct_original_total_via_real_functions():
+    # 실제 calculate_actual_material_cost_excluding_gfm_by_contract()와
+    # calculate_government_furnished_material_by_contract()를 그대로 호출해
+    # (합성 material_issue 기준) 얻은 두 결과를 오케스트레이터에 넣었을 때도
+    # "DM excluding GFM + GFM = 원래 전체 재료비"라는 항등식이 orchestrator
+    # 안에서도 깨지지 않는지 확인한다.
+    contracts_ga = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
+    work_orders = [{"wo_no": "WO-1", "contract_no": "CONTRACT-A"}]
+    material_issues = [
+        _issue("WO-1", issued_qty="10", unit_cost="100", supply_type="GOVERNMENT"),
+        _issue("WO-1", issued_qty="5", unit_cost="200", supply_type="COMPANY"),
+    ]
+    dm_excl_by_contract = calculate_actual_material_cost_excluding_gfm_by_contract(
+        contracts_ga, work_orders, material_issues,
+    )
+    gfm_by_contract_raw = calculate_government_furnished_material_by_contract(
+        contracts_ga, work_orders, material_issues,
+    )
+    gfm_by_contract = {"CONTRACT-A": gfm_by_contract_raw["CONTRACT-A"]["gfm_amount"]}
+
+    total_material_cost = calculate_actual_material_cost(
+        [{"wo_no": "WO-1", "product_code": "P-100", "period_key": "2026-07"}],
+        material_issues, [_material()], [_product()],
+    )["WO-1"]
+
+    result = calculate_regulatory_ga_by_contract(
+        {"CONTRACT-A": {}},
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("0")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        gfm_by_contract,
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="10")],
+        contracts_ga,
+        "INCLUDE_GFM",
+        _REF_DATE,
+        dm_excl_by_contract,
+    )
+    assert total_material_cost == Decimal("2000.00")  # 10x100(GOV) + 5x200(COMPANY)
+    assert result["CONTRACT-A"]["ga_base_amount_actual"] == total_material_cost
+
+def test_regulatory_ga_dm_excluding_gfm_none_makes_actual_ga_not_calculable():
+    result = calculate_regulatory_ga_by_contract(
+        {"CONTRACT-A": {"actual_labor_cost": Decimal("200"), "actual_overhead_cost": Decimal("300")}},
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("2000000.00")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("100")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {},
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "EXCLUDE_GFM",
+        _REF_DATE,
+        {"CONTRACT-A": {"dm_excluding_gfm": None}},  # 관급/사급 미분류로 계산 불가
+    )
+    c = result["CONTRACT-A"]
+    assert c["manufacturing_cost_excluding_government_material_actual"] is None
+    assert c["ga_base_amount_actual"] is None
+    assert c["calculable"] is False
+    assert c["ga_actual"] is None
+    assert c["reason"] is not None
+
+def test_regulatory_ga_de_added_exactly_once_not_missing_not_doubled():
+    result = calculate_regulatory_ga_by_contract(
+        {"CONTRACT-A": {}},  # actual_labor_cost/actual_overhead_cost 없음 -> 0
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("0")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("300")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {},
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="10")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "EXCLUDE_GFM",
+        _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000"),
+    )
+    c = result["CONTRACT-A"]
+    # 1000(DM) + 0(DL) + 0(OH) + 300(DE) = 1300 — DE가 누락(1000)되거나
+    # 두 번 더해지지(1600) 않았다.
+    assert c["ga_base_amount_actual"] == Decimal("1300")
+
+def test_regulatory_ga_gfm_zero_vs_missing_distinction_preserved_with_new_dm_input():
+    # dm_excluding_gfm_by_contract가 새로 추가된 뒤에도, GFM=0(확인된 0원)과
+    # GFM 자체가 없는 경우(dict에 항목 없음)의 구분이 여전히 유지되는지
+    # 재확인한다.
+    common_args = (
+        {"CONTRACT-A": {}},
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("0")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+    )
+    rate_rules = [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")]
+    contracts = [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")]
+    dm_excl = _dm_excl_gfm("CONTRACT-A", "1000")
+
+    result_zero_gfm = calculate_regulatory_ga_by_contract(
+        *common_args, {"CONTRACT-A": Decimal("0")}, rate_rules, contracts, "INCLUDE_GFM",
+        _REF_DATE, dm_excl,
+    )
+    result_missing_gfm = calculate_regulatory_ga_by_contract(
+        *common_args, {}, rate_rules, contracts, "INCLUDE_GFM", _REF_DATE, dm_excl,
+    )
+    assert result_zero_gfm["CONTRACT-A"]["calculable"] is True
+    assert result_zero_gfm["CONTRACT-A"]["ga_base_amount_actual"] == Decimal("1000")
+    assert result_missing_gfm["CONTRACT-A"]["calculable"] is False
+    assert result_missing_gfm["CONTRACT-A"]["ga_base_amount_actual"] is None
+
+def test_legacy_calculate_ga_by_contract_result_unchanged_by_regulatory_function_changes():
+    # calculate_ga_by_contract()(보호 함수)는 dm_excluding_gfm_by_contract
+    # 파라미터 추가와 완전히 무관하다 — 이 회귀 테스트가 통과한다는 것은
+    # 레거시 함수의 결과가 이번 변경으로 전혀 달라지지 않았다는 뜻이다.
+    actual_by_contract = {"CONTRACT-A": {"actual_manufacturing_cost": Decimal("1000000.00")}}
+    budget_by_contract = {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("2000000.00")}}
+    contracts_old = [{"contract_no": "CONTRACT-A", "contract_type": "MULTI_PRODUCT"}]
+
+    result = calculate_ga_by_contract(
+        actual_by_contract, budget_by_contract,
+        [{"rule_id": "OLD-1", "rate_type": "GA", "contract_type": "MULTI_PRODUCT",
+          "rate_pct": "8", "priority": "10"}],
+        contracts_old,
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["ga_rate"] == Decimal("8")
+    assert c["ga_actual"] == Decimal("80000.00")
+    assert c["ga_budget"] == Decimal("160000.00")
+    assert c["ga_variance"] == Decimal("-80000.00")
 
 
 # --- calculate_government_furnished_material_by_contract (Phase 2 9단계) ---

@@ -1453,6 +1453,19 @@ def resolve_ga_actual_rate(rate_rules, company_code, plant_code, fiscal_year, re
     후보를 좁히고, 그 다음 완전히 별도로 effective 기간을 검사한다
     (_in_ga_rate_effective_range).
 
+    [reference_date 생성에 대한 명시적 제약]
+    이 함수는 물론이고 이 함수를 호출하는 어떤 코드도 `contract.start_date`
+    /`contract.end_date`를 reference_date로 대신 사용해서는 안 된다. 조사
+    결과 방산원가규칙 제28조와 시행세칙 제32조는 GA 기준일을 계약방식별로
+    최소 4가지로 구분한다(확정계약 예정가격=계약동의서 서명날인 직전,
+    개산계약 정산=납기·최종납품일 중 먼저 도래하는 날, 중도확정계약=
+    중도확정일, 특정비목불확정계약=예정가격 결정 시점) — 이 중 어느 것도
+    `start_date`/`end_date`라는 이름과 문언상 일치하지 않는다. 게다가
+    30_contract.xlsx의 `start_date`/`end_date`가 실제로 이 4가지 법정
+    기준일 중 무엇을 의미하는지조차 **확인되지 않았다**(Phase 1 설계
+    문서·데이터 생성 스크립트 어디에도 정의가 없음). 따라서 그 법적 의미가
+    밝혀지기 전까지는 두 필드를 reference_date로 쓸 근거가 없다.
+
     plant_code가 법적 "부문"과 동일하다고 이 함수가 단정하지 않는다 —
     현재 30_contract.xlsx에는 plant_code/fiscal_year 컬럼이 없어 실제
     데이터로 호출하면 사실상 항상 None이 들어와 조회 결과도 None이 된다.
@@ -1503,6 +1516,13 @@ def resolve_ga_ceiling_rate(rate_rules, industry_type, company_size, reference_d
     동일한 원칙). effective 기간 판정 규칙(None 처리, 문자열 비교)도
     resolve_ga_actual_rate와 완전히 동일하다(_in_ga_rate_effective_range 공유).
 
+    [reference_date 생성에 대한 명시적 제약 — resolve_ga_actual_rate와 동일]
+    `contract.start_date`/`contract.end_date`를 reference_date로 대신
+    사용하지 않는다. 두 필드가 방산원가규칙 제28조·시행세칙 제32조가 구분하는
+    4가지 법정 기준일(계약동의서 서명날인 직전/납기·최종납품일/중도확정일/
+    예정가격 결정 시점) 중 무엇에 대응하는지 확인되지 않았기 때문이다(자세한
+    근거는 resolve_ga_actual_rate() docstring 참고).
+
     현재 30_contract.xlsx에는 industry_type/company_size 컬럼이 없어
     실제 데이터로 호출하면 항상 None이 들어와 조회 결과도 None이 된다
     (의도된 동작 — §resolve_ga_actual_rate와 동일한 이유).
@@ -1543,6 +1563,7 @@ def calculate_regulatory_ga_by_contract(
     contracts,
     calculation_basis,
     reference_date,
+    dm_excluding_gfm_by_contract,
 ) -> dict[str, dict]:
     """
     calculate_ga_by_contract()와 나란히 존재하는 "규정 정합 구조" 버전이다
@@ -1550,15 +1571,43 @@ def calculate_regulatory_ga_by_contract(
     함수는 아직 어디에도 연결되지 않은 준비 단계 코드다).
 
     기존 함수와의 핵심 차이:
-      1. GA 기준액에 직접경비(DE)를 포함한다 — manufacturing_cost_excluding_
-         government_material = DM+DL+OH(actual_by_contract/budget_by_contract) +
-         DE(actual_direct_expense_by_contract/budget_direct_expense_by_contract).
-         Budget DE가 계산 불가(calculable=False)면 예산 쪽 기준액 전체가
-         None이 된다(0으로 대체하지 않음).
-      2. 관급재료비(government_furnished_material_by_contract)를
+      1. Actual 쪽 제조원가는 더 이상 actual_by_contract의
+         actual_manufacturing_cost(DM+DL+OH가 이미 합쳐진 값)를 쓰지 않는다.
+         그 DM 성분은 calculate_actual_material_cost()(Phase 1 보호 함수)가
+         supply_type을 구분하지 않고 관급+사급을 모두 합친 값이라서,
+         여기에 관급재료비(government_furnished_material_by_contract)를
+         또 더하면 관급분이 이중집계되기 때문이다(이전 라운드
+         test_dm_excl_gfm_plus_gfm_equals_total_material_cost_no_double_counting
+         에서 실제로 재현·확인됨). 대신 다음처럼 재구성한다:
+
+           manufacturing_cost_excluding_government_material_actual =
+               dm_excluding_gfm_by_contract[contract_no]["dm_excluding_gfm"]
+             + actual_by_contract[contract_no]["actual_labor_cost"]
+             + actual_by_contract[contract_no]["actual_overhead_cost"]
+             + actual_direct_expense_by_contract[contract_no]["direct_expense_amount"]
+
+         dm_excluding_gfm_by_contract는
+         calculate_actual_material_cost_excluding_gfm_by_contract()의 출력을
+         그대로 넣는 외부 입력이다(이 함수가 스스로 계산하지 않는다).
+         그 계약의 dm_excluding_gfm이 None(예: material_issue 중 하나라도
+         supply_type이 미분류라 "계산 불가"인 경우)이면, DL/OH/DE가 전부
+         계산 가능하더라도 Actual 쪽 전체 제조원가와 ga_base_amount_actual,
+         ga_actual까지 전부 None으로 남긴다 — 일부만이라도 더해서 부분
+         합계를 만들지 않는다("계산 불가 ≠ 0" 원칙의 연장).
+      2. Budget 쪽은 이번 변경과 무관하게 그대로 유지한다 — 여전히
+         budget_by_contract의 budget_manufacturing_cost(DM+DL+OH 합계,
+         관급/사급 구분 없음) + budget_direct_expense_by_contract를 쓴다.
+         12_standard_cost.xlsx에는 supply_type에 대응하는 개념이 전혀 없어
+         (이전 라운드에서 스키마로 확인됨) Budget 쪽에서 관급재료비를
+         분리해낼 방법이 아직 없기 때문이다 — 근거 없이 임의로 Actual과
+         똑같은 구조를 강제하지 않는다.
+      3. 관급재료비(government_furnished_material_by_contract)를
          calculate_ga_base_amount()로 조합한다 — 외부에서 주어지는 dict이며
-         이 함수는 관급재료비를 스스로 계산하지 않는다(§6 정책).
-      3. rate 조회를 resolve_ga_actual_rate()(실적, company+plant+fiscal_year+
+         이 함수는 관급재료비를 스스로 계산하지 않는다(§6 정책). Actual
+         쪽 DM이 이제 실제로 관급재료비를 제외한 값이므로, INCLUDE_GFM
+         basis에서 이 값을 다시 더하는 것이 처음으로 이중집계 없이
+         올바르게 성립한다.
+      4. rate 조회를 resolve_ga_actual_rate()(실적, company+plant+fiscal_year+
          reference_date)와 resolve_ga_ceiling_rate()(상한, industry_type+
          company_size+reference_date)로 완전히 분리한다. 두 축의 매칭 키는
          contract 행에서 그대로 읽는다(contract.get("plant_code") 등) —
@@ -1566,7 +1615,7 @@ def calculate_regulatory_ga_by_contract(
          항상 None이 되어 두 조회 모두 (None, None)이 된다. 이는 §3에서
          이미 확인된 데이터 격차이며, 이번 단계에서 그 컬럼을 새로 추가하지
          않는다.
-      4. reference_date는 이 함수가 스스로 정하지 않는다(현재 날짜나
+      5. reference_date는 이 함수가 스스로 정하지 않는다(현재 날짜나
          contract.get("start_date") 등을 내부에서 임의로 쓰지 않음) — 호출자가
          명시적으로 전달해야 한다. "언제를 기준으로 GA 요율을 조회할
          것인가"는 사전원가/확정원가 산정 시점처럼 업무 프로세스가 결정할
@@ -1587,7 +1636,7 @@ def calculate_regulatory_ga_by_contract(
          하단의 별도 설명 참고). 이 함수는 아직 CLI에 연결되지 않았으므로
          향후 그 근거가 확보되면 기존 호출자를 깨지 않고(추가 파라미터로)
          확장할 수 있다.
-      5. 상한 초과 여부(exceeds_ceiling)는 참고용으로만 계산해 노출한다 —
+      6. 상한 초과 여부(exceeds_ceiling)는 참고용으로만 계산해 노출한다 —
          "실적요율이 상한을 넘으면 상한으로 대체한다"는 식의 정책은 아직
          확정되지 않았으므로(§C, 미해결) ga_actual/ga_budget 계산에는
          반영하지 않는다.
@@ -1604,13 +1653,22 @@ def calculate_regulatory_ga_by_contract(
         if contract_no is None:
             continue
 
-        actual_mfg = actual_by_contract.get(contract_no, {}).get(
-            "actual_manufacturing_cost", zero
-        )
         actual_de = actual_direct_expense_by_contract.get(contract_no, {}).get(
             "direct_expense_amount", zero
         )
-        mfg_excl_gfm_actual = actual_mfg + actual_de
+        dm_excluding_gfm = dm_excluding_gfm_by_contract.get(contract_no, {}).get(
+            "dm_excluding_gfm"
+        )
+        if dm_excluding_gfm is None:
+            mfg_excl_gfm_actual = None
+        else:
+            actual_dl = actual_by_contract.get(contract_no, {}).get(
+                "actual_labor_cost", zero
+            )
+            actual_oh = actual_by_contract.get(contract_no, {}).get(
+                "actual_overhead_cost", zero
+            )
+            mfg_excl_gfm_actual = dm_excluding_gfm + actual_dl + actual_oh + actual_de
 
         budget_mfg = budget_by_contract.get(contract_no, {}).get(
             "budget_manufacturing_cost", zero
@@ -1667,7 +1725,8 @@ def calculate_regulatory_ga_by_contract(
         if ga_base_actual is None:
             entry["reason"] = (
                 "GA 기준액(Actual)을 계산할 수 없습니다 "
-                "(제조원가 또는 관급재료비 데이터 부재)."
+                "(관급재료비 제외 재료비(dm_excluding_gfm) 계산 불가, "
+                "제조원가 데이터 부재, 또는 관급재료비 데이터 부재)."
             )
         elif actual_rate is None:
             entry["reason"] = (
@@ -1796,6 +1855,129 @@ def calculate_government_furnished_material_by_contract(
             entry["reason"] = (
                 f"material_issue {entry['untagged_issue_count']}건의 supply_type이 "
                 "분류되지 않아 관급재료비를 계산할 수 없습니다."
+            )
+
+    return result
+
+
+def calculate_actual_material_cost_excluding_gfm_by_contract(
+    contracts,
+    work_orders,
+    material_issues,
+) -> dict[str, dict]:
+    """
+    Phase 2 GA 규정 정합 구조 준비: contract_no -> 관급재료비(GFM)를 제외한
+    사급재료비만의 실적 재료비 집계.
+
+    calculate_actual_material_cost()(Phase 1 보호 함수, 이 함수를 만들면서도
+    수정하지 않았다)는 supply_type을 전혀 참조하지 않고 모든 material_issue
+    행을 그대로 합산한다 — 그 결과는 "사급재료비만"이 아니라 "관급+사급을
+    합친 총 재료비"다(이전 라운드에서 synthetic 테스트로 확인됨:
+    test_actual_material_cost_ignores_supply_type_includes_everything).
+    방산원가규칙 제6조의 제조원가 정의(관급재료비 제외)를 만족하는 별도
+    계산 경로가 필요해 이 함수를 신설한다 — 기존 함수를 대체하지 않고
+    나란히 존재하는 새 함수다.
+
+    wo_no -> work_order.contract_no 귀속 방식은
+    calculate_government_furnished_material_by_contract()와 완전히 동일하게
+    유지한다(material master/product 등록 여부는 검사하지 않는다 — Phase 1
+    DM 집계의 엄격한 유효성 검사와는 다른, GA 결합형 함수 계열의 기존
+    스타일을 따른 것이다). 두 함수가 정확히 같은 wo_no->contract_no
+    매핑을 쓰기 때문에, 모든 관련 행의 supply_type이 분류되어 있다면
+    다음 항등식이 항상 성립한다(이중집계 없음의 근거):
+
+        이 함수의 dm_excluding_gfm
+      + calculate_government_furnished_material_by_contract()의 gfm_amount
+      = 그 계약에 귀속되는 material_issue 전체 금액(순액, RETURN 반영)
+
+    "계산 불가 ≠ 0" 원칙은 GFM 함수와 완전히 동일하게 적용한다: 어떤
+    계약에 귀속되는 material_issue 행 중 하나라도 supply_type이
+    None(미분류)이면, 그 행이 실제로 관급인지 사급인지 알 수 없으므로
+    계약 전체를 계산 불가(calculable=False, dm_excluding_gfm=None)로
+    남긴다 — 미분류 행을 "사급(그대로 포함)"으로 임의 간주하지 않는다.
+
+    supply_type == "GOVERNMENT"인 행은 금액에서 제외한다. "GOVERNMENT"가
+    아닌 다른 명시적 값(예: "COMPANY")만 금액에 더한다. issue_type이
+    "RETURN"이면 차감한다(calculate_actual_material_cost()와 동일한
+    계산 규칙).
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(다른 결합형
+    함수와 동일한 pre-seeding 정책).
+
+    이 함수는 아직 calculate_regulatory_ga_by_contract()에 연결되지
+    않았다 — 준비 단계 코드다. CLI에도 연결되지 않는다.
+
+    Returns:
+        {contract_no: {
+            "dm_excluding_gfm": Decimal|None,
+            "company_issue_count": int,
+            "untagged_issue_count": int,
+            "calculable": bool,
+            "reason": str,
+        }}
+    """
+    zero = Decimal("0")
+
+    contract_nos = {
+        c.get("contract_no") for c in contracts if c.get("contract_no") is not None
+    }
+    contract_no_by_wo = {
+        w.get("wo_no"): w.get("contract_no")
+        for w in work_orders if w.get("wo_no") is not None
+    }
+
+    result: dict[str, dict] = {
+        contract_no: {
+            "dm_excluding_gfm": zero,
+            "company_issue_count": 0,
+            "untagged_issue_count": 0,
+            "calculable": True,
+            "reason": None,
+        }
+        for contract_no in contract_nos
+    }
+
+    for r in material_issues:
+        wo_no = r.get("wo_no")
+        if wo_no is None:
+            continue
+
+        contract_no = contract_no_by_wo.get(wo_no)
+        if contract_no is None or contract_no not in contract_nos:
+            continue
+
+        entry = result[contract_no]
+        supply_type = r.get("supply_type")
+
+        if supply_type is None:
+            entry["untagged_issue_count"] += 1
+            entry["calculable"] = False
+            continue
+
+        if supply_type == "GOVERNMENT":
+            continue
+
+        qty = _strict_decimal(r.get("issued_qty"))
+        unit_cost = _strict_decimal(r.get("unit_cost"))
+        if qty is None or unit_cost is None:
+            continue
+
+        line_amount = calculate_material_cost(qty, unit_cost)
+        if r.get("issue_type") == "RETURN":
+            line_amount = -line_amount
+
+        entry["dm_excluding_gfm"] += line_amount
+        entry["company_issue_count"] += 1
+
+    for entry in result.values():
+        if entry["calculable"]:
+            entry["dm_excluding_gfm"] = round_amount(entry["dm_excluding_gfm"])
+            entry["reason"] = "OK"
+        else:
+            entry["dm_excluding_gfm"] = None
+            entry["reason"] = (
+                f"material_issue {entry['untagged_issue_count']}건의 supply_type이 "
+                "분류되지 않아 관급재료비 제외 재료비를 계산할 수 없습니다."
             )
 
     return result
