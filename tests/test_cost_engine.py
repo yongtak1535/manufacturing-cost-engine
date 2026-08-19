@@ -16,6 +16,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_total_variance_by_wo,
     calculate_material_price_quantity_variance_by_wo,
     calculate_applied_overhead_by_cost_center,
+    calculate_actual_total_cost_by_contract,
 )
 
 
@@ -670,3 +671,133 @@ def test_applied_overhead_by_cost_center_excludes_invalid_labor_rows():
         [_product()],
     )
     assert result == {}
+
+
+# --- calculate_actual_total_cost_by_contract (Phase 2 1단계) ---
+
+def _wo_with_contract(wo_no, contract_no, product_code="P-100"):
+    return {**_wo(wo_no=wo_no, product_code=product_code), "contract_no": contract_no}
+
+def test_actual_total_cost_by_contract_aggregates_multiple_wo():
+    # CONTRACT-A에 WO-1, WO-2 두 건이 연결된 경우, 두 WO의 Actual 합계가
+    # 계약 합계와 정확히 일치해야 한다(테스트 A와 동일한 패턴, 합성 데이터).
+    actual_totals_by_wo = {
+        "WO-1": {"material_cost": Decimal("100.00"), "labor_cost": Decimal("50"),
+                  "overhead_cost": Decimal("10.00"), "total_cost": Decimal("160.00")},
+        "WO-2": {"material_cost": Decimal("200.00"), "labor_cost": Decimal("70"),
+                  "overhead_cost": Decimal("20.00"), "total_cost": Decimal("290.00")},
+    }
+    result = calculate_actual_total_cost_by_contract(
+        [
+            _wo_with_contract("WO-1", "CONTRACT-A"),
+            _wo_with_contract("WO-2", "CONTRACT-A"),
+        ],
+        actual_totals_by_wo,
+    )
+    c = result["CONTRACT-A"]
+    assert c["actual_material_cost"] == Decimal("300.00")
+    assert c["actual_labor_cost"] == Decimal("120")
+    assert c["actual_overhead_cost"] == Decimal("30.00")
+    assert c["actual_manufacturing_cost"] == Decimal("450.00")
+    assert c["work_order_count"] == 2
+    assert c["work_orders"] == ["WO-1", "WO-2"]
+
+def test_actual_total_cost_by_contract_excludes_wo_without_contract_no():
+    # contract_no가 None인 WO는 어떤 계약에도 집계되지 않고 결과에서도 나타나지 않는다.
+    actual_totals_by_wo = {
+        "WO-1": {"material_cost": Decimal("100.00"), "labor_cost": Decimal("50"),
+                  "overhead_cost": Decimal("10.00"), "total_cost": Decimal("160.00")},
+    }
+    result = calculate_actual_total_cost_by_contract(
+        [_wo_with_contract("WO-1", None)],
+        actual_totals_by_wo,
+    )
+    assert result == {}
+
+def test_actual_total_cost_by_contract_defaults_missing_actual_to_zero():
+    # 계약에 연결됐지만 실적 거래가 전혀 없어 actual_totals_by_wo에 없는 WO는
+    # 0으로 집계되고, work_order_count에는 그대로 포함된다(생략되지 않음).
+    result = calculate_actual_total_cost_by_contract(
+        [_wo_with_contract("WO-1", "CONTRACT-A")],
+        {},
+    )
+    c = result["CONTRACT-A"]
+    assert c["actual_material_cost"] == Decimal("0")
+    assert c["actual_labor_cost"] == Decimal("0")
+    assert c["actual_overhead_cost"] == Decimal("0")
+    assert c["actual_manufacturing_cost"] == Decimal("0")
+    assert c["work_order_count"] == 1
+    assert c["work_orders"] == ["WO-1"]
+
+
+# --- 실제 Phase 1 데이터 기준 Contract 검증 (테스트 A/B, 데이터셋 존재 시에만 실행) ---
+
+def _load_real_contract_scenario():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    actual_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        rows("07_product_master.xlsx", "product"),
+    )
+    return calculate_actual_total_cost_by_contract(work_orders, actual_by_wo)
+
+def test_real_dataset_contract_001_matches_wo_001_002_003_sum():
+    result = _load_real_contract_scenario()
+    if result is None:
+        return
+
+    c = result["CONTRACT-001"]
+    assert c["work_order_count"] == 3
+    assert set(c["work_orders"]) == {"WO-2607-001", "WO-2607-002", "WO-2607-003"}
+    assert c["actual_material_cost"] == Decimal("704220.88")
+    assert c["actual_labor_cost"] == Decimal("636000")
+    assert c["actual_overhead_cost"] == Decimal("477000.00")
+    assert c["actual_manufacturing_cost"] == Decimal("1817220.88")
+
+def test_real_dataset_contract_002_matches_wo_004_005_010_013_sum():
+    result = _load_real_contract_scenario()
+    if result is None:
+        return
+
+    c = result["CONTRACT-002"]
+    assert c["work_order_count"] == 4
+    assert set(c["work_orders"]) == {"WO-2607-004", "WO-2607-005", "WO-2607-010", "WO-2607-013"}
+    assert c["actual_material_cost"] == Decimal("1089612.00")
+    assert c["actual_labor_cost"] == Decimal("96000")
+    assert c["actual_overhead_cost"] == Decimal("72000.00")
+    assert c["actual_manufacturing_cost"] == Decimal("1257612.00")
+
+def test_real_dataset_contract_003_has_zero_actual_cost_no_transactions_yet():
+    # WO-2607-018/019은 OPEN 상태이며 실적 거래가 전혀 없다 — 0으로 집계되어야
+    # 하며(생략되지 않음), 계약 미배정 WO는 이 결과에 전혀 나타나지 않아야 한다.
+    result = _load_real_contract_scenario()
+    if result is None:
+        return
+
+    c = result["CONTRACT-003"]
+    assert c["work_order_count"] == 2
+    assert set(c["work_orders"]) == {"WO-2607-018", "WO-2607-019"}
+    assert c["actual_material_cost"] == Decimal("0")
+    assert c["actual_labor_cost"] == Decimal("0")
+    assert c["actual_overhead_cost"] == Decimal("0")
+    assert c["actual_manufacturing_cost"] == Decimal("0")
+
+    assert set(result.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}

@@ -4,7 +4,7 @@ from manufacturing_cost_engine.validation import (
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_labor, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files,
-    calculate_oh_under_over_applied,
+    calculate_oh_under_over_applied, validate_contract,
 )
 from decimal import Decimal
 
@@ -1614,3 +1614,49 @@ def test_duplicate_files_multiple_groups_reported_separately():
 def test_duplicate_files_single_file_group_ignored():
     # 방어적: 그룹에 파일이 하나뿐이면 중복이 아니다.
     assert validate_duplicate_files([("hash-a", ["only.xlsx"])]) == []
+
+
+# --- validate_contract (Phase 2 1단계) ---
+
+def _contract(contract_no="CONTRACT-001"):
+    return {"company_code": "HB01", "contract_no": contract_no}
+
+def _contract_wo(wo_no="WO-1", contract_no=None, source_row=2):
+    return {"wo_no": wo_no, "contract_no": contract_no, "_source_row": source_row}
+
+def test_validate_contract_no_issues_when_all_references_valid():
+    issues = validate_contract(
+        [_contract("CONTRACT-001"), _contract("CONTRACT-002")],
+        [_contract_wo("WO-1", "CONTRACT-001"), _contract_wo("WO-2", None)],
+    )
+    assert issues == []
+
+def test_validate_contract_wo_without_contract_no_is_not_an_error():
+    # 계약 미배정 WO는 정상 상태이지 오류가 아니다.
+    issues = validate_contract(
+        [_contract("CONTRACT-001")],
+        [_contract_wo("WO-1", None)],
+    )
+    assert issues == []
+
+def test_validate_contract_unknown_contract_reference():
+    # work_order가 contract master에 없는 contract_no를 참조하는 경우.
+    issues = validate_contract(
+        [_contract("CONTRACT-001")],
+        [_contract_wo("WO-1", "CONTRACT-999")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UNKNOWN_CONTRACT"
+    assert issues[0].severity == "CRITICAL"
+    assert issues[0].related_entity == "WO-1"
+
+def test_validate_contract_duplicate_contract_no_reuses_duplicate_natural_key():
+    # 동일 contract_no가 contract master에 중복 등록된 경우 기존
+    # duplicate_keys() 헬퍼를 재사용해 DUPLICATE_NATURAL_KEY를 보고한다
+    # (새 error code를 만들지 않는다).
+    issues = validate_contract(
+        [_contract("CONTRACT-001"), _contract("CONTRACT-001")],
+        [],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "DUPLICATE_NATURAL_KEY"

@@ -82,10 +82,10 @@ def test_phase1_loaded_rows_have_source_row():
 def test_phase1_dataset_has_expected_scale():
     data = load_dataset(DATASET_DIR)
 
-    # 20개 로딩 대상 Excel
+    # 21개 로딩 대상 Excel (Phase 2 1단계: 30_contract.xlsx 추가)
     files = excel_files(DATASET_DIR)
 
-    assert len(files) == 20
+    assert len(files) == 21
 
     # 주요 거래 데이터가 실제로 로드되었는지 확인
     assert len(data["20_work_order.xlsx::work_order"]) == 20

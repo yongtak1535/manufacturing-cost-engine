@@ -10,11 +10,12 @@ from .validation import (
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files,
-    calculate_oh_under_over_applied,
+    calculate_oh_under_over_applied, validate_contract,
 )
 from .cost_engine import (
     calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
     calculate_material_price_quantity_variance_by_wo,
+    calculate_actual_total_cost_by_contract,
 )
 
 def main():
@@ -34,6 +35,9 @@ def main():
 
     products = rows("07_product_master.xlsx", "product")
     issues += validate_work_orders(rows("20_work_order.xlsx", "work_order"), products)
+
+    contracts = rows("30_contract.xlsx", "contract")
+    issues += validate_contract(contracts, rows("20_work_order.xlsx", "work_order"))
 
     issues += validate_material_issues(
         rows("22_material_issue.xlsx", "material_issue"),
@@ -205,6 +209,16 @@ def main():
         v = oh_under_over_by_cc[key]
         print(f"  {key}: actual_oh={v['actual_oh']}, applied_oh={v['applied_oh']}, "
               f"difference={v['difference']}, no_labor_data={v['no_labor_data']}")
+
+    actual_cost_by_contract = calculate_actual_total_cost_by_contract(
+        work_orders, actual_cost_by_wo,
+    )
+    print(f"Contract Actual Cost calculated for {len(actual_cost_by_contract)} contract(s)")
+    for contract_no in sorted(actual_cost_by_contract):
+        v = actual_cost_by_contract[contract_no]
+        print(f"  {contract_no}: work_orders={v['work_order_count']}, "
+              f"DM={v['actual_material_cost']}, DL={v['actual_labor_cost']}, "
+              f"OH={v['actual_overhead_cost']}, Total={v['actual_manufacturing_cost']}")
 
 if __name__ == "__main__":
     main()

@@ -661,3 +661,56 @@ def calculate_applied_overhead_by_cost_center(
         )
 
     return applied_by_cc
+
+
+def calculate_actual_total_cost_by_contract(
+    work_orders,
+    actual_totals_by_wo,
+) -> dict[str, dict]:
+    """
+    Phase 2 1단계: contract_no -> {"actual_material_cost", "actual_labor_cost",
+    "actual_overhead_cost", "actual_manufacturing_cost", "work_order_count",
+    "work_orders"}.
+
+    calculate_actual_total_cost_by_wo()가 이미 계산한 WO 단위 결과를 그대로
+    재사용해 contract_no 기준으로 재집계한다 — 자재/노무/OH 필터링 로직을
+    다시 구현하지 않는다.
+
+    work_order.contract_no가 없는(None) WO는 집계에서 제외한다(계약 미배정
+    WO를 오류로 취급하지 않고, 결과에서 조용히 빠질 뿐 — 기존 Actual Cost
+    계산에는 전혀 영향을 주지 않는다).
+
+    계약에 연결됐지만 실적 거래가 전혀 없어 actual_totals_by_wo에 없는 WO는
+    0으로 취급한다 — calculate_total_variance_by_wo()가 이미 채택한 "실적
+    없음은 0, 계산 불가와는 다르다" 정책과 동일하다.
+    """
+    zero = Decimal("0")
+    result: dict[str, dict] = {}
+
+    for wo in work_orders:
+        contract_no = wo.get("contract_no")
+        if contract_no is None:
+            continue
+
+        wo_no = wo.get("wo_no")
+        actual = actual_totals_by_wo.get(wo_no, {
+            "material_cost": zero, "labor_cost": zero, "overhead_cost": zero,
+            "total_cost": zero,
+        })
+
+        entry = result.setdefault(contract_no, {
+            "actual_material_cost": zero,
+            "actual_labor_cost": zero,
+            "actual_overhead_cost": zero,
+            "actual_manufacturing_cost": zero,
+            "work_order_count": 0,
+            "work_orders": [],
+        })
+        entry["actual_material_cost"] += actual["material_cost"]
+        entry["actual_labor_cost"] += actual["labor_cost"]
+        entry["actual_overhead_cost"] += actual["overhead_cost"]
+        entry["actual_manufacturing_cost"] += actual["total_cost"]
+        entry["work_order_count"] += 1
+        entry["work_orders"].append(wo_no)
+
+    return result

@@ -1351,3 +1351,37 @@ def calculate_oh_under_over_applied(
         }
 
     return result
+
+def validate_contract(contracts, work_orders,
+                      file="30_contract.xlsx", sheet="contract"):
+    """
+    Phase 2 1단계 Contract 데이터 검증(최소 범위).
+
+    - 동일 contract_no가 contract master에 중복 등록된 경우: 기존 duplicate_keys()
+      헬퍼를 그대로 재사용한다(DUPLICATE_NATURAL_KEY, 이미 validate_account_mapping/
+      validate_standard_cost가 쓰는 것과 동일한 코드 — 새 코드를 만들지 않는다).
+    - work_order.contract_no가 contract master에 존재하지 않는 값을 참조하는 경우:
+      UNKNOWN_PRODUCT/UNKNOWN_WO/UNKNOWN_ROUTING 등 기존 "미등록 참조" 코드들과
+      동일한 명명/심각도 규칙을 따르는 UNKNOWN_CONTRACT(CRITICAL)로 보고한다.
+
+    contract_no가 없는(None) WO는 계약 미배정 상태일 뿐이므로 오류로 보고하지
+    않는다.
+    """
+    issues = []
+    issues += duplicate_keys(contracts, ["contract_no"], file, sheet)
+
+    contract_nos = {c.get("contract_no") for c in contracts}
+    for wo in work_orders:
+        contract_no = wo.get("contract_no")
+        if contract_no is None:
+            continue
+
+        if contract_no not in contract_nos:
+            issues.append(_issue(
+                "UNKNOWN_CONTRACT", "CRITICAL", "20_work_order.xlsx",
+                "work_order", wo.get("_source_row"),
+                f"WO={wo.get('wo_no')}: 존재하지 않는 contract_no={contract_no}",
+                wo.get("wo_no")
+            ))
+
+    return issues
