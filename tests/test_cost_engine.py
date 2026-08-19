@@ -19,6 +19,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_actual_total_cost_by_contract,
     calculate_standard_budget_by_contract,
     calculate_contract_variance,
+    calculate_actual_direct_expense_by_contract,
 )
 
 
@@ -1230,3 +1231,200 @@ def test_real_dataset_contract_variance_003():
     assert c["oh_variance"] == Decimal("-475920.00")
     assert c["total_variance"] == Decimal("-1596162.00")
     assert c["budget_coverage_complete"] is True
+
+
+# --- calculate_actual_direct_expense_by_contract (Phase 2 4단계) ---
+
+def _de_contract(contract_no):
+    return {"contract_no": contract_no}
+
+def _de_work_order(wo_no, contract_no):
+    return {"wo_no": wo_no, "contract_no": contract_no}
+
+def _de_row(expense_id="DE-1", contract_no=None, wo_no=None, amount="1000"):
+    return {
+        "expense_id": expense_id, "contract_no": contract_no,
+        "wo_no": wo_no, "amount": amount,
+    }
+
+def test_direct_expense_by_contract_wo_attributed_rolls_up_through_work_order():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [_de_work_order("WO-1", "CONTRACT-A")],
+        [_de_row("DE-1", wo_no="WO-1", amount="500000")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense_amount"] == Decimal("500000.00")
+    assert c["expense_count"] == 1
+    assert c["expense_ids"] == ["DE-1"]
+
+def test_direct_expense_by_contract_contract_attributed_directly():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [_de_row("DE-1", contract_no="CONTRACT-A", amount="1200000")],
+    )
+    assert result["CONTRACT-A"]["direct_expense_amount"] == Decimal("1200000.00")
+
+def test_direct_expense_by_contract_mixes_wo_and_contract_attributed_rows():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [_de_work_order("WO-1", "CONTRACT-A")],
+        [
+            _de_row("DE-1", wo_no="WO-1", amount="500000"),
+            _de_row("DE-2", contract_no="CONTRACT-A", amount="300000"),
+        ],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense_amount"] == Decimal("800000.00")
+    assert c["expense_count"] == 2
+
+def test_direct_expense_by_contract_excludes_dual_attributed_row():
+    # wo_no와 contract_no가 동시에 있는 행은 어느 쪽으로도 집계하지 않는다
+    # (validate_direct_expense가 EXPENSE_TARGET_CONFLICT로 별도 보고).
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [_de_work_order("WO-1", "CONTRACT-A")],
+        [_de_row("DE-1", contract_no="CONTRACT-A", wo_no="WO-1", amount="500000")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense_amount"] == Decimal("0.00")
+    assert c["expense_count"] == 0
+
+def test_direct_expense_by_contract_excludes_row_with_no_target():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [_de_row("DE-1", amount="500000")],
+    )
+    assert result["CONTRACT-A"]["expense_count"] == 0
+
+def test_direct_expense_by_contract_excludes_expense_on_unassigned_wo():
+    # 계약이 배정되지 않은 WO의 경비는 어떤 계약에도 귀속되지 않는다(오류 아님).
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [_de_work_order("WO-9", None)],
+        [_de_row("DE-1", wo_no="WO-9", amount="200000")],
+    )
+    assert result["CONTRACT-A"]["direct_expense_amount"] == Decimal("0.00")
+
+def test_direct_expense_by_contract_excludes_unknown_contract_reference():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [_de_row("DE-1", contract_no="CONTRACT-999", amount="500000")],
+    )
+    assert set(result.keys()) == {"CONTRACT-A"}
+    assert result["CONTRACT-A"]["expense_count"] == 0
+
+def test_direct_expense_by_contract_negative_amount_nets_down():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [_de_work_order("WO-1", "CONTRACT-A")],
+        [
+            _de_row("DE-1", wo_no="WO-1", amount="500000"),
+            _de_row("DE-2", wo_no="WO-1", amount="-50000"),
+        ],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense_amount"] == Decimal("450000.00")
+    assert c["expense_count"] == 2
+
+def test_direct_expense_by_contract_zero_amount_counted_but_adds_nothing():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [_de_row("DE-1", contract_no="CONTRACT-A", amount="0")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense_amount"] == Decimal("0.00")
+    assert c["expense_count"] == 1
+
+def test_direct_expense_by_contract_seeds_contract_with_no_expenses():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A"), _de_contract("CONTRACT-EMPTY")],
+        [],
+        [_de_row("DE-1", contract_no="CONTRACT-A", amount="1000")],
+    )
+    assert set(result.keys()) == {"CONTRACT-A", "CONTRACT-EMPTY"}
+    assert result["CONTRACT-EMPTY"]["direct_expense_amount"] == Decimal("0.00")
+    assert result["CONTRACT-EMPTY"]["expense_ids"] == []
+
+def test_direct_expense_by_contract_excludes_unparseable_amount():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [_de_row("DE-1", contract_no="CONTRACT-A", amount="1,2 3 4")],
+    )
+    assert result["CONTRACT-A"]["expense_count"] == 0
+
+def test_direct_expense_by_contract_decimal_precision():
+    result = calculate_actual_direct_expense_by_contract(
+        [_de_contract("CONTRACT-A")],
+        [],
+        [
+            _de_row("DE-1", contract_no="CONTRACT-A", amount="100.005"),
+            _de_row("DE-2", contract_no="CONTRACT-A", amount="0.005"),
+        ],
+    )
+    # 100.005 + 0.005 = 100.010 -> ROUND_HALF_UP -> 100.01
+    assert result["CONTRACT-A"]["direct_expense_amount"] == Decimal("100.01")
+
+
+# --- 실제 Phase 2 데이터 기준 Direct Expense 검증 ---
+
+def _load_real_direct_expense():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    return calculate_actual_direct_expense_by_contract(
+        rows("30_contract.xlsx", "contract"),
+        rows("20_work_order.xlsx", "work_order"),
+        rows("31_direct_expense.xlsx", "direct_expense"),
+    )
+
+def test_real_dataset_direct_expense_contract_001_rolls_up_via_work_orders():
+    # DE-2607-001(500,000, WO-2607-001) + DE-2607-003(300,000, WO-2607-003)
+    # + DE-2607-004(-50,000 환입, WO-2607-001) = 750,000
+    result = _load_real_direct_expense()
+    if result is None:
+        return
+    c = result["CONTRACT-001"]
+    assert c["direct_expense_amount"] == Decimal("750000.00")
+    assert c["expense_count"] == 3
+
+def test_real_dataset_direct_expense_contract_002_direct_attribution():
+    result = _load_real_direct_expense()
+    if result is None:
+        return
+    c = result["CONTRACT-002"]
+    assert c["direct_expense_amount"] == Decimal("1200000.00")
+    assert c["expense_count"] == 1
+
+def test_real_dataset_direct_expense_contract_003_zero_amount_row():
+    result = _load_real_direct_expense()
+    if result is None:
+        return
+    c = result["CONTRACT-003"]
+    assert c["direct_expense_amount"] == Decimal("0.00")
+    assert c["expense_count"] == 1
+
+def test_real_dataset_direct_expense_excludes_unassigned_wo_expense():
+    # DE-2607-005는 WO-2607-006(계약 미배정) 소속이라 어떤 계약에도 잡히지 않는다.
+    result = _load_real_direct_expense()
+    if result is None:
+        return
+    all_ids = {eid for c in result.values() for eid in c["expense_ids"]}
+    assert "DE-2607-005" not in all_ids
+    assert set(result.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}

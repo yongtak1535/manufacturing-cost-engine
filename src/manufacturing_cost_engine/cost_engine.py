@@ -933,3 +933,89 @@ def calculate_contract_variance(
         }
 
     return result
+
+
+def calculate_actual_direct_expense_by_contract(
+    contracts,
+    work_orders,
+    direct_expenses,
+) -> dict[str, dict]:
+    """
+    Phase 2 4단계: contract_no -> {"direct_expense_amount", "expense_count",
+    "expense_ids"}.
+
+    31_direct_expense.xlsx의 amount가 직접경비의 유일한 canonical source다.
+    24_gl_transaction.xlsx의 금액은 여기서 다시 집계하지 않는다(이중집계 방지).
+    direct_expense 행의 gl_account_code는 추적용 참조 메타데이터일 뿐이다.
+
+    귀속 규칙(한 행은 wo_no 또는 contract_no 중 정확히 하나만 가진다):
+      - wo_no만 있는 행: 그 WO의 work_order.contract_no로 귀속시킨다(행에
+        계약을 중복 저장하지 않고 항상 WO를 통해 파생시킨다).
+      - contract_no만 있는 행: 그 계약에 직접 귀속시킨다.
+
+    다음 행은 집계에서 제외한다(0으로 채우지 않는다):
+      - wo_no와 contract_no가 동시에 있는 행 — 귀속 대상이 모순이라
+        어느 쪽으로도 계산하지 않는다. validate_direct_expense()가
+        EXPENSE_TARGET_CONFLICT로 별도 보고한다.
+      - wo_no와 contract_no가 모두 없는 행 — 귀속 대상이 없다.
+      - wo_no가 work_order에 없거나, 그 WO에 contract_no가 없는 행
+        (계약 미배정 WO의 경비) — 오류가 아니라 계약 집계 대상이 아닐 뿐이다.
+      - contract_no가 contract master에 없는 행(UNKNOWN_CONTRACT로 별도 보고).
+      - amount가 숫자로 변환되지 않는 행(INVALID_DECIMAL로 별도 보고).
+
+    금액이 0이거나 음수(환입)인 행은 정상적으로 합산한다 — 0/음수는 유효한
+    계산 결과이지 계산 불가 상태가 아니다.
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(직접경비가 하나도
+    없는 계약도 0으로 나타난다 — calculate_standard_budget_by_contract()와
+    동일한 pre-seeding 정책).
+    """
+    zero = Decimal("0")
+
+    contract_nos = {
+        c.get("contract_no") for c in contracts if c.get("contract_no") is not None
+    }
+    contract_no_by_wo = {
+        w.get("wo_no"): w.get("contract_no")
+        for w in work_orders if w.get("wo_no") is not None
+    }
+
+    result: dict[str, dict] = {
+        contract_no: {
+            "direct_expense_amount": zero,
+            "expense_count": 0,
+            "expense_ids": [],
+        }
+        for contract_no in contract_nos
+    }
+
+    for r in direct_expenses:
+        wo_no = r.get("wo_no")
+        contract_no = r.get("contract_no")
+
+        if wo_no is not None and contract_no is not None:
+            continue
+        if wo_no is None and contract_no is None:
+            continue
+
+        if wo_no is not None:
+            contract_no = contract_no_by_wo.get(wo_no)
+            if contract_no is None:
+                continue
+
+        if contract_no not in contract_nos:
+            continue
+
+        amount = _strict_decimal(r.get("amount"))
+        if amount is None:
+            continue
+
+        entry = result[contract_no]
+        entry["direct_expense_amount"] += amount
+        entry["expense_count"] += 1
+        entry["expense_ids"].append(r.get("expense_id"))
+
+    for entry in result.values():
+        entry["direct_expense_amount"] = round_amount(entry["direct_expense_amount"])
+
+    return result

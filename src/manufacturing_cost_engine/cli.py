@@ -10,7 +10,7 @@ from .validation import (
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files,
-    calculate_oh_under_over_applied, validate_contract,
+    calculate_oh_under_over_applied, validate_contract, validate_direct_expense,
 )
 from .cost_engine import (
     calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
@@ -18,6 +18,7 @@ from .cost_engine import (
     calculate_actual_total_cost_by_contract,
     calculate_standard_budget_by_contract,
     calculate_contract_variance,
+    calculate_actual_direct_expense_by_contract,
 )
 
 def main():
@@ -40,6 +41,11 @@ def main():
 
     contracts = rows("30_contract.xlsx", "contract")
     issues += validate_contract(contracts, rows("20_work_order.xlsx", "work_order"))
+
+    direct_expenses = rows("31_direct_expense.xlsx", "direct_expense")
+    issues += validate_direct_expense(
+        direct_expenses, contracts, rows("20_work_order.xlsx", "work_order")
+    )
 
     issues += validate_material_issues(
         rows("22_material_issue.xlsx", "material_issue"),
@@ -243,6 +249,15 @@ def main():
         print(f"  {contract_no}: DM={v['dm_variance']}, DL={v['dl_variance']}, "
               f"OH={v['oh_variance']}, Total={v['total_variance']}, "
               f"budget_coverage_complete={v['budget_coverage_complete']}")
+
+    de_by_contract = calculate_actual_direct_expense_by_contract(
+        contracts, work_orders, direct_expenses,
+    )
+    print(f"Contract Direct Expense calculated for {len(de_by_contract)} contract(s)")
+    for contract_no in sorted(de_by_contract):
+        v = de_by_contract[contract_no]
+        print(f"  {contract_no}: expenses={v['expense_count']}, "
+              f"DE={v['direct_expense_amount']}")
 
 if __name__ == "__main__":
     main()

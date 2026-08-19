@@ -1385,3 +1385,67 @@ def validate_contract(contracts, work_orders,
             ))
 
     return issues
+
+def validate_direct_expense(direct_expenses, contracts, work_orders,
+                            file="31_direct_expense.xlsx", sheet="direct_expense"):
+    """
+    Phase 2 4단계 직접경비(Direct Expense) 검증.
+
+    기존 코드를 최대한 재사용하고 새 error code는 하나만 추가한다:
+      - expense_id 중복: 기존 duplicate_keys() -> DUPLICATE_NATURAL_KEY
+      - contract_no가 contract master에 없음: 기존 UNKNOWN_CONTRACT
+      - wo_no가 work_order에 없음: 기존 UNKNOWN_WO
+      - amount를 숫자로 변환 불가: 기존 INVALID_DECIMAL
+      - wo_no와 contract_no 동시 존재: EXPENSE_TARGET_CONFLICT (신규)
+        한 행은 둘 중 정확히 하나만 가져야 한다 — 동시에 있으면 WO를 통한
+        계약 귀속과 행에 적힌 계약이 서로 어긋날 수 있어 이중 귀속이 된다.
+
+    wo_no와 contract_no가 모두 없는 행, 그리고 contract_no가 없는 WO를
+    가리키는 행은 오류로 보고하지 않는다 — 계약에 배정되지 않은 경비일 뿐이며
+    계약 집계에서 조용히 제외된다(계약 미배정 WO를 오류로 만들지 않는
+    기존 정책과 동일).
+
+    금액이 0이거나 음수(환입)인 것도 오류가 아니다.
+    """
+    issues = []
+    issues += duplicate_keys(direct_expenses, ["expense_id"], file, sheet)
+
+    contract_nos = {c.get("contract_no") for c in contracts}
+    wo_nos = {w.get("wo_no") for w in work_orders}
+
+    for r in direct_expenses:
+        row = r.get("_source_row")
+        expense_id = r.get("expense_id")
+        wo_no = r.get("wo_no")
+        contract_no = r.get("contract_no")
+
+        if wo_no is not None and contract_no is not None:
+            issues.append(_issue(
+                "EXPENSE_TARGET_CONFLICT", "ERROR", file, sheet, row,
+                f"expense_id={expense_id}: wo_no={wo_no}와 contract_no={contract_no}가 "
+                f"동시에 지정되어 귀속 대상이 모순입니다(둘 중 하나만 있어야 합니다).",
+                expense_id
+            ))
+
+        if contract_no is not None and contract_no not in contract_nos:
+            issues.append(_issue(
+                "UNKNOWN_CONTRACT", "CRITICAL", file, sheet, row,
+                f"expense_id={expense_id}: 존재하지 않는 contract_no={contract_no}",
+                expense_id
+            ))
+
+        if wo_no is not None and wo_no not in wo_nos:
+            issues.append(_issue(
+                "UNKNOWN_WO", "CRITICAL", file, sheet, row,
+                f"expense_id={expense_id}: 존재하지 않는 wo_no={wo_no}", expense_id
+            ))
+
+        if _to_decimal(r.get("amount")) is None:
+            issues.append(_issue(
+                "INVALID_DECIMAL", "CRITICAL", file, sheet, row,
+                f"expense_id={expense_id}: amount를 숫자로 변환할 수 없습니다: "
+                f"{r.get('amount')!r}",
+                expense_id
+            ))
+
+    return issues

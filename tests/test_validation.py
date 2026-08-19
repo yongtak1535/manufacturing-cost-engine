@@ -4,7 +4,7 @@ from manufacturing_cost_engine.validation import (
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_labor, validate_gl_period, validate_tolerance_rules,
     validate_bom_version, validate_labor_hours, validate_duplicate_files,
-    calculate_oh_under_over_applied, validate_contract,
+    calculate_oh_under_over_applied, validate_contract, validate_direct_expense,
 )
 from decimal import Decimal
 
@@ -1660,3 +1660,112 @@ def test_validate_contract_duplicate_contract_no_reuses_duplicate_natural_key():
     )
     assert len(issues) == 1
     assert issues[0].code == "DUPLICATE_NATURAL_KEY"
+
+
+# --- validate_direct_expense (Phase 2 4단계) ---
+
+def _de(expense_id="DE-1", contract_no=None, wo_no=None, amount="1000",
+        source_row=2):
+    return {
+        "company_code": "HB01", "expense_id": expense_id,
+        "contract_no": contract_no, "wo_no": wo_no, "amount": amount,
+        "_source_row": source_row,
+    }
+
+def _de_wo(wo_no="WO-1", contract_no="CONTRACT-001"):
+    return {"wo_no": wo_no, "contract_no": contract_no}
+
+def test_validate_direct_expense_wo_attributed_row_is_clean():
+    issues = validate_direct_expense(
+        [_de("DE-1", wo_no="WO-1")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert issues == []
+
+def test_validate_direct_expense_contract_attributed_row_is_clean():
+    issues = validate_direct_expense(
+        [_de("DE-1", contract_no="CONTRACT-001")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert issues == []
+
+def test_validate_direct_expense_both_targets_is_conflict():
+    issues = validate_direct_expense(
+        [_de("DE-1", contract_no="CONTRACT-001", wo_no="WO-1")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "EXPENSE_TARGET_CONFLICT"
+    assert issues[0].severity == "ERROR"
+    assert issues[0].related_entity == "DE-1"
+
+def test_validate_direct_expense_no_target_is_not_an_error():
+    # wo_no/contract_no가 모두 없는 행은 계약 미배정일 뿐 오류가 아니다.
+    issues = validate_direct_expense(
+        [_de("DE-1")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert issues == []
+
+def test_validate_direct_expense_wo_without_contract_is_not_an_error():
+    # 계약 미배정 WO를 가리키는 경비도 오류가 아니다(집계에서만 빠진다).
+    issues = validate_direct_expense(
+        [_de("DE-1", wo_no="WO-9")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-9", None)],
+    )
+    assert issues == []
+
+def test_validate_direct_expense_unknown_contract():
+    issues = validate_direct_expense(
+        [_de("DE-1", contract_no="CONTRACT-999")],
+        [_contract("CONTRACT-001")],
+        [],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UNKNOWN_CONTRACT"
+    assert issues[0].severity == "CRITICAL"
+
+def test_validate_direct_expense_unknown_wo():
+    issues = validate_direct_expense(
+        [_de("DE-1", wo_no="WO-999")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UNKNOWN_WO"
+    assert issues[0].severity == "CRITICAL"
+
+def test_validate_direct_expense_duplicate_expense_id():
+    issues = validate_direct_expense(
+        [_de("DE-1", wo_no="WO-1"), _de("DE-1", wo_no="WO-1", source_row=3)],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "DUPLICATE_NATURAL_KEY"
+
+def test_validate_direct_expense_invalid_amount():
+    issues = validate_direct_expense(
+        [_de("DE-1", wo_no="WO-1", amount="1,2 3 4")],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "INVALID_DECIMAL"
+
+def test_validate_direct_expense_zero_and_negative_amounts_are_clean():
+    # 0원과 음수(환입)는 유효한 금액이지 오류가 아니다.
+    issues = validate_direct_expense(
+        [
+            _de("DE-1", wo_no="WO-1", amount="0"),
+            _de("DE-2", wo_no="WO-1", amount="-50000", source_row=3),
+        ],
+        [_contract("CONTRACT-001")],
+        [_de_wo("WO-1", "CONTRACT-001")],
+    )
+    assert issues == []
