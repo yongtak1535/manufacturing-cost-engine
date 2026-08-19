@@ -17,6 +17,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_material_price_quantity_variance_by_wo,
     calculate_applied_overhead_by_cost_center,
     calculate_actual_total_cost_by_contract,
+    calculate_standard_budget_by_contract,
 )
 
 
@@ -801,3 +802,249 @@ def test_real_dataset_contract_003_has_zero_actual_cost_no_transactions_yet():
     assert c["actual_manufacturing_cost"] == Decimal("0")
 
     assert set(result.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}
+
+
+# --- calculate_standard_budget_by_contract (Phase 2 2단계) ---
+
+def _budget_contract(contract_no="CONTRACT-A"):
+    return {"company_code": "HB01", "contract_no": contract_no}
+
+def _budget_wo(wo_no, contract_no, product_code="P-100", planned_qty="10",
+               period_key="2026-07", wo_status="CLOSED"):
+    return {
+        "wo_no": wo_no, "product_code": product_code, "period_key": period_key,
+        "planned_qty": planned_qty, "contract_no": contract_no,
+        "wo_status": wo_status,
+    }
+
+def test_standard_budget_by_contract_aggregates_multiple_wo_same_product():
+    # 테스트 A: 계약 1개에 WO 2건(동일 제품) 연결 -> planned_qty x 표준원가 합산.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [
+            _budget_wo("WO-1", "CONTRACT-A", "P-100", "10"),
+            _budget_wo("WO-2", "CONTRACT-A", "P-100", "5"),
+        ],
+        [
+            _standard_cost("P-100", cost_element_code="DM", standard_amount="100"),
+            _standard_cost("P-100", cost_element_code="DL", standard_amount="50"),
+            _standard_cost("P-100", cost_element_code="OH", standard_amount="30"),
+        ],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    # WO-1: DM=1000,DL=500,OH=300 / WO-2: DM=500,DL=250,OH=150 -> 합계 DM=1500,DL=750,OH=450
+    assert c["budget_material_cost"] == Decimal("1500.00")
+    assert c["budget_labor_cost"] == Decimal("750.00")
+    assert c["budget_overhead_cost"] == Decimal("450.00")
+    assert c["budget_manufacturing_cost"] == Decimal("2700.00")
+    assert c["work_order_count"] == 2
+    assert c["work_orders"] == ["WO-1", "WO-2"]
+
+def test_standard_budget_by_contract_aggregates_different_products():
+    # 테스트 B: 동일 계약에 서로 다른 제품(P-100, P-300)이 섞여도 정확히 합산.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [
+            _budget_wo("WO-1", "CONTRACT-A", "P-100", "10"),
+            _budget_wo("WO-2", "CONTRACT-A", "P-300", "4"),
+        ],
+        [
+            _standard_cost("P-100", cost_element_code="DM", standard_amount="100"),
+            _standard_cost("P-300", cost_element_code="DM", standard_amount="200"),
+        ],
+        [_product("P-100"), _product("P-300")],
+    )
+    c = result["CONTRACT-A"]
+    # WO-1: DM=100x10=1000.00, WO-2: DM=200x4=800.00 -> 합계 1800.00
+    assert c["budget_material_cost"] == Decimal("1800.00")
+    assert c["work_order_count"] == 2
+    assert set(c["work_orders"]) == {"WO-1", "WO-2"}
+
+def test_standard_budget_by_contract_excludes_wo_without_contract_no():
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", None, "P-100", "10")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    # contract_no가 없는 WO는 어떤 계약 결과에도 나타나지 않는다.
+    c = result["CONTRACT-A"]
+    assert c["work_order_count"] == 0
+    assert c["work_orders"] == []
+    assert c["budget_material_cost"] == Decimal("0")
+
+def test_standard_budget_by_contract_no_standard_cost_marked_unpriced_not_zero():
+    # P-900처럼 standard_cost가 전혀 없는 제품 -> 0으로 채우지 않고 명시적으로
+    # unpriced_work_orders에 남긴다.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-900", "10")],
+        [],
+        [_product("P-900")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["work_order_count"] == 0
+    assert c["unpriced_work_orders"] == ["WO-1"]
+    assert c["budget_material_cost"] == Decimal("0")
+
+def test_standard_budget_by_contract_partial_standard_cost_only_includes_present_elements():
+    # DM만 표준이 있는 경우 DL/OH는 work_order_budgets에 키 자체가 없어야 한다.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "10")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    wo_budget = c["work_order_budgets"]["WO-1"]
+    assert wo_budget["budget_material_cost"] == Decimal("1000.00")
+    assert "budget_labor_cost" not in wo_budget
+    assert "budget_overhead_cost" not in wo_budget
+    assert c["budget_material_cost"] == Decimal("1000.00")
+    assert c["budget_labor_cost"] == Decimal("0")
+
+def test_standard_budget_by_contract_period_key_must_match_wo_period():
+    # standard_cost가 다른 period_key로만 존재하면(하드코딩 매칭이 아니라 실제
+    # WO의 period_key와 일치해야 함) 계산 불가로 처리한다.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "10", period_key="2026-07")],
+        [_standard_cost("P-100", period_key="2026-08", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["unpriced_work_orders"] == ["WO-1"]
+
+def test_standard_budget_by_contract_zero_or_missing_planned_qty_marked_unpriced():
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "0")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["work_order_count"] == 0
+    assert c["unpriced_work_orders"] == ["WO-1"]
+
+def test_standard_budget_by_contract_open_wo_with_planned_qty_is_calculated():
+    # OPEN 상태(기간걸침 포함)인 WO도 planned_qty만 있으면 Budget 계산이 되어야 한다
+    # (Total Variance/Actual Cost와 달리 wo_status나 실적 유무와 무관).
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "10", wo_status="OPEN")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["work_order_count"] == 1
+    assert c["budget_material_cost"] == Decimal("1000.00")
+
+def test_standard_budget_by_contract_independent_of_good_qty_or_production_output():
+    # 함수 시그니처 자체가 production_output/good_qty를 전혀 받지 않는다 —
+    # good_qty=0이나 산출 실적 없음과 무관하게 planned_qty만으로 계산됨을 증명한다.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "10")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="100")],
+        [_product("P-100")],
+    )
+    assert result["CONTRACT-A"]["budget_material_cost"] == Decimal("1000.00")
+
+def test_standard_budget_by_contract_decimal_precision():
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-100", "3")],
+        [_standard_cost("P-100", cost_element_code="DM", standard_amount="33.335")],
+        [_product("P-100")],
+    )
+    # 33.335 x 3 = 100.005 -> ROUND_HALF_UP -> 100.01
+    assert result["CONTRACT-A"]["budget_material_cost"] == Decimal("100.01")
+
+def test_standard_budget_by_contract_seeds_contract_with_no_linked_wo():
+    # contracts에 등록됐지만 연결된 WO가 하나도 없는 계약도 0/빈 값으로 나타난다
+    # (조용히 사라지지 않는다).
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-EMPTY")],
+        [],
+        [],
+        [],
+    )
+    c = result["CONTRACT-EMPTY"]
+    assert c["work_order_count"] == 0
+    assert c["work_orders"] == []
+    assert c["budget_manufacturing_cost"] == Decimal("0")
+
+def test_standard_budget_by_contract_excludes_wo_with_unregistered_product():
+    # product_code가 product master에 없는 WO는(기존 Actual Cost 계열과 동일하게)
+    # 제외된다.
+    result = calculate_standard_budget_by_contract(
+        [_budget_contract("CONTRACT-A")],
+        [_budget_wo("WO-1", "CONTRACT-A", "P-999", "10")],
+        [],
+        [_product("P-100")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["work_order_count"] == 0
+    assert c["unpriced_work_orders"] == []
+    assert c["work_orders"] == []
+
+
+# --- 실제 Phase 1 데이터 기준 Contract Budget 검증 ---
+
+def _load_real_contract_budget():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    return calculate_standard_budget_by_contract(
+        rows("30_contract.xlsx", "contract"),
+        rows("20_work_order.xlsx", "work_order"),
+        rows("12_standard_cost.xlsx", "standard_cost"),
+        rows("07_product_master.xlsx", "product"),
+    )
+
+def test_real_dataset_budget_contract_001():
+    result = _load_real_contract_budget()
+    if result is None:
+        return
+    c = result["CONTRACT-001"]
+    assert c["work_order_count"] == 3
+    assert c["budget_material_cost"] == Decimal("908440.00")
+    assert c["budget_labor_cost"] == Decimal("1407840.00")
+    assert c["budget_overhead_cost"] == Decimal("1055880.00")
+    assert c["budget_manufacturing_cost"] == Decimal("3372160.00")
+
+def test_real_dataset_budget_contract_002():
+    result = _load_real_contract_budget()
+    if result is None:
+        return
+    c = result["CONTRACT-002"]
+    assert c["work_order_count"] == 4
+    assert c["budget_material_cost"] == Decimal("1108992.00")
+    assert c["budget_labor_cost"] == Decimal("1359360.00")
+    assert c["budget_overhead_cost"] == Decimal("1019520.00")
+    assert c["budget_manufacturing_cost"] == Decimal("3487872.00")
+
+def test_real_dataset_budget_contract_003_open_wo_still_budgeted():
+    # WO-2607-018/019은 OPEN 상태로 실적이 없지만 planned_qty가 있으므로
+    # Budget은 정상 계산되어야 한다(Actual Cost=0인 것과는 별개).
+    result = _load_real_contract_budget()
+    if result is None:
+        return
+    c = result["CONTRACT-003"]
+    assert c["work_order_count"] == 2
+    assert c["budget_material_cost"] == Decimal("485682.00")
+    assert c["budget_labor_cost"] == Decimal("634560.00")
+    assert c["budget_overhead_cost"] == Decimal("475920.00")
+    assert c["budget_manufacturing_cost"] == Decimal("1596162.00")

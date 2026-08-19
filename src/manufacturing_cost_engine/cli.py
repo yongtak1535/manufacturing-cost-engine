@@ -16,6 +16,7 @@ from .cost_engine import (
     calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
     calculate_material_price_quantity_variance_by_wo,
     calculate_actual_total_cost_by_contract,
+    calculate_standard_budget_by_contract,
 )
 
 def main():
@@ -219,6 +220,18 @@ def main():
         print(f"  {contract_no}: work_orders={v['work_order_count']}, "
               f"DM={v['actual_material_cost']}, DL={v['actual_labor_cost']}, "
               f"OH={v['actual_overhead_cost']}, Total={v['actual_manufacturing_cost']}")
+
+    budget_by_contract = calculate_standard_budget_by_contract(
+        contracts, work_orders,
+        rows("12_standard_cost.xlsx", "standard_cost"),
+        products,
+    )
+    print(f"Contract Budget calculated for {len(budget_by_contract)} contract(s)")
+    for contract_no in sorted(budget_by_contract):
+        v = budget_by_contract[contract_no]
+        print(f"  {contract_no}: work_orders={v['work_order_count']}, "
+              f"DM={v['budget_material_cost']}, DL={v['budget_labor_cost']}, "
+              f"OH={v['budget_overhead_cost']}, Total={v['budget_manufacturing_cost']}")
 
 if __name__ == "__main__":
     main()

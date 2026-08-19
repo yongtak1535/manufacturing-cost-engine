@@ -714,3 +714,136 @@ def calculate_actual_total_cost_by_contract(
         entry["work_orders"].append(wo_no)
 
     return result
+
+
+def calculate_standard_budget_by_contract(
+    contracts,
+    work_orders,
+    standard_cost_header,
+    products,
+) -> dict[str, dict]:
+    """
+    Phase 2 2단계: contract_no -> {
+        "budget_material_cost", "budget_labor_cost", "budget_overhead_cost",
+        "budget_manufacturing_cost", "work_order_count", "work_orders",
+        "unpriced_work_orders", "work_order_budgets",
+    }.
+
+    Budget = standard_cost.standard_amount(제품 1단위당) × 해당 WO의 planned_qty.
+
+    calculate_total_variance_by_wo()의 Flexed Standard(= standard_amount ×
+    good_qty)와 개념적으로 다르다 — Total Variance는 "실제 생산량(good_qty)"
+    기준이고, Contract Budget은 "계약상 계획 수량(planned_qty)" 기준이다. 이번
+    데이터셋에서는 대부분 planned_qty == good_qty이지만(WO-2607-009는
+    good_qty=0, WO-2607-017은 production_output 자체가 없음 — 둘 다
+    planned_qty는 존재), 개념이 다르므로 이 함수는 production_output/good_qty를
+    전혀 참조하지 않는다.
+
+    다음 WO는 Budget 계산에서 제외한다(0으로 채우지 않음):
+      - contract_no가 없는(None) WO — 오류 아님, 계약 미배정일 뿐.
+      - product_code가 product master에 등록되지 않은 WO(기존 Actual Cost
+        계열과 동일하게 _valid_work_order_nos()로 걸러낸다).
+      - planned_qty가 없거나 0인 WO — "unpriced_work_orders"에 명시적으로
+        남겨 계산 불가 상태를 드러낸다(생략 사유를 구분할 수 있도록).
+      - 제품의 standard_cost가 DM/DL/OH 전부 없는 WO(예: P-900) — 역시
+        "unpriced_work_orders"에 남긴다. STANDARD_COST_MISSING 검증과
+        중복되지 않도록 여기서는 새 ValidationIssue를 만들지 않는다.
+
+    good_qty=0이거나 production_output이 아예 없는 WO도 planned_qty만
+    유효하면 정상적으로 Budget에 포함된다 — Total Variance와의 핵심 차이.
+
+    DM/DL/OH 중 일부만 표준이 존재하면 있는 요소만 합산하고, 없는 요소는
+    work_order_budgets의 해당 WO 항목에 포함하지 않는다(calculate_total_variance_by_wo와
+    동일한 정책 — 임의로 0 처리하지 않는다).
+
+    contracts에 등록됐지만 연결된 WO가 하나도 없거나 전부 계산 불가인 계약도
+    결과에 0/빈 값으로 나타난다(조용히 사라지지 않는다).
+    """
+    standard_amount_by_key: dict[tuple, Decimal] = {}
+    for h in standard_cost_header:
+        product_code = h.get("product_code")
+        period_key = h.get("period_key")
+        cost_element_code = h.get("cost_element_code")
+        amount = _strict_decimal(h.get("standard_amount"))
+        if product_code is None or period_key is None or cost_element_code is None:
+            continue
+        if amount is None:
+            continue
+        standard_amount_by_key[(product_code, period_key, cost_element_code)] = amount
+
+    valid_wo_nos = _valid_work_order_nos(work_orders, products)
+
+    zero = Decimal("0")
+
+    def _blank_entry():
+        return {
+            "budget_material_cost": zero,
+            "budget_labor_cost": zero,
+            "budget_overhead_cost": zero,
+            "budget_manufacturing_cost": zero,
+            "work_order_count": 0,
+            "work_orders": [],
+            "unpriced_work_orders": [],
+            "work_order_budgets": {},
+        }
+
+    result: dict[str, dict] = {}
+    for c in contracts:
+        contract_no = c.get("contract_no")
+        if contract_no is not None:
+            result.setdefault(contract_no, _blank_entry())
+
+    for wo in work_orders:
+        contract_no = wo.get("contract_no")
+        if contract_no is None:
+            continue
+
+        wo_no = wo.get("wo_no")
+        if wo_no not in valid_wo_nos:
+            continue
+
+        entry = result.setdefault(contract_no, _blank_entry())
+
+        planned_qty = _strict_decimal(wo.get("planned_qty"))
+        if not planned_qty:
+            entry["unpriced_work_orders"].append(wo_no)
+            continue
+
+        product_code = wo.get("product_code")
+        period_key = wo.get("period_key")
+
+        dm_standard = standard_amount_by_key.get((product_code, period_key, "DM"))
+        dl_standard = standard_amount_by_key.get((product_code, period_key, "DL"))
+        oh_standard = standard_amount_by_key.get((product_code, period_key, "OH"))
+        if dm_standard is None and dl_standard is None and oh_standard is None:
+            entry["unpriced_work_orders"].append(wo_no)
+            continue
+
+        wo_budget = {"planned_qty": planned_qty}
+        wo_total = zero
+
+        if dm_standard is not None:
+            flexed_dm = round_amount(dm_standard * planned_qty)
+            wo_budget["budget_material_cost"] = flexed_dm
+            entry["budget_material_cost"] += flexed_dm
+            wo_total += flexed_dm
+
+        if dl_standard is not None:
+            flexed_dl = round_amount(dl_standard * planned_qty)
+            wo_budget["budget_labor_cost"] = flexed_dl
+            entry["budget_labor_cost"] += flexed_dl
+            wo_total += flexed_dl
+
+        if oh_standard is not None:
+            flexed_oh = round_amount(oh_standard * planned_qty)
+            wo_budget["budget_overhead_cost"] = flexed_oh
+            entry["budget_overhead_cost"] += flexed_oh
+            wo_total += flexed_oh
+
+        wo_budget["budget_manufacturing_cost"] = wo_total
+        entry["budget_manufacturing_cost"] += wo_total
+        entry["work_order_count"] += 1
+        entry["work_orders"].append(wo_no)
+        entry["work_order_budgets"][wo_no] = wo_budget
+
+    return result
