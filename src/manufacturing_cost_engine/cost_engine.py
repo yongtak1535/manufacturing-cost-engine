@@ -847,3 +847,89 @@ def calculate_standard_budget_by_contract(
         entry["work_order_budgets"][wo_no] = wo_budget
 
     return result
+
+
+def calculate_contract_variance(
+    contracts,
+    actual_by_contract,
+    budget_by_contract,
+) -> dict[str, dict]:
+    """
+    Phase 2 3단계: contract_no -> {
+        "dm_variance", "dl_variance", "oh_variance", "total_variance",
+        "actual_manufacturing_cost", "budget_manufacturing_cost",
+        "unpriced_work_orders", "mismatched_work_orders",
+        "budget_coverage_complete",
+    }.
+
+    Variance = Actual − Budget. calculate_actual_total_cost_by_contract()와
+    calculate_standard_budget_by_contract()가 이미 계산한 두 dict를 그대로
+    받아 차감만 한다 — 두 함수 자체는 재계산하지도, 수정하지도 않는다.
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(WO가 하나도 연결되지
+    않았거나 Actual/Budget 어느 한쪽에만 존재하는 계약도 포함). Actual 또는
+    Budget 중 한쪽에 해당 contract_no가 없으면 그 쪽은 0으로 취급한다.
+
+    calculate_actual_total_cost_by_contract()는 product 유효성을 검사하지
+    않고 contract_no만으로 WO를 모으는 반면, calculate_standard_budget_by_contract()는
+    _valid_work_order_nos()로 미등록 product WO를 완전히 제외한다(표준원가가
+    없는 WO는 unpriced_work_orders에 남기지만, 미등록 product WO는 거기에도
+    남지 않는다). 이 때문에 두 함수의 work_orders 집합이 어긋날 수 있으므로,
+    Actual에는 있지만 Budget의 work_orders/unpriced_work_orders 어디에도
+    없는 WO(또는 반대의 경우)를 "mismatched_work_orders"로 표시한다.
+
+    budget_coverage_complete = unpriced_work_orders와 mismatched_work_orders가
+    모두 비었을 때만 True — Total Variance 숫자가 Actual에 반영된 모든 WO에
+    대해 빠짐없이 Budget이 계산된 상태에서 나온 값인지를 나타낸다. False이면
+    이 계약의 Variance는 일부 WO의 Budget 누락으로 왜곡될 수 있다는 뜻이다.
+    """
+    zero = Decimal("0")
+
+    def _blank_actual():
+        return {
+            "actual_material_cost": zero, "actual_labor_cost": zero,
+            "actual_overhead_cost": zero, "actual_manufacturing_cost": zero,
+            "work_orders": [],
+        }
+
+    def _blank_budget():
+        return {
+            "budget_material_cost": zero, "budget_labor_cost": zero,
+            "budget_overhead_cost": zero, "budget_manufacturing_cost": zero,
+            "work_orders": [], "unpriced_work_orders": [],
+        }
+
+    contract_nos = {c.get("contract_no") for c in contracts if c.get("contract_no") is not None}
+    contract_nos |= set(actual_by_contract) | set(budget_by_contract)
+
+    result: dict[str, dict] = {}
+    for contract_no in contract_nos:
+        actual = actual_by_contract.get(contract_no, _blank_actual())
+        budget = budget_by_contract.get(contract_no, _blank_budget())
+
+        actual_wos = set(actual.get("work_orders", []))
+        unpriced_wos = list(budget.get("unpriced_work_orders", []))
+        budget_known_wos = set(budget.get("work_orders", [])) | set(unpriced_wos)
+        mismatched_wos = sorted(actual_wos.symmetric_difference(budget_known_wos))
+
+        result[contract_no] = {
+            "dm_variance": round_amount(
+                actual["actual_material_cost"] - budget["budget_material_cost"]
+            ),
+            "dl_variance": round_amount(
+                actual["actual_labor_cost"] - budget["budget_labor_cost"]
+            ),
+            "oh_variance": round_amount(
+                actual["actual_overhead_cost"] - budget["budget_overhead_cost"]
+            ),
+            "total_variance": round_amount(
+                actual["actual_manufacturing_cost"] - budget["budget_manufacturing_cost"]
+            ),
+            "actual_manufacturing_cost": actual["actual_manufacturing_cost"],
+            "budget_manufacturing_cost": budget["budget_manufacturing_cost"],
+            "unpriced_work_orders": unpriced_wos,
+            "mismatched_work_orders": mismatched_wos,
+            "budget_coverage_complete": not unpriced_wos and not mismatched_wos,
+        }
+
+    return result

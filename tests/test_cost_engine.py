@@ -18,6 +18,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_applied_overhead_by_cost_center,
     calculate_actual_total_cost_by_contract,
     calculate_standard_budget_by_contract,
+    calculate_contract_variance,
 )
 
 
@@ -1048,3 +1049,184 @@ def test_real_dataset_budget_contract_003_open_wo_still_budgeted():
     assert c["budget_labor_cost"] == Decimal("634560.00")
     assert c["budget_overhead_cost"] == Decimal("475920.00")
     assert c["budget_manufacturing_cost"] == Decimal("1596162.00")
+
+
+# --- calculate_contract_variance (Phase 2 3단계) ---
+
+def _variance_contract(contract_no):
+    return {"contract_no": contract_no}
+
+def _actual_entry(material="0", labor="0", overhead="0", total="0", work_orders=None):
+    return {
+        "actual_material_cost": Decimal(material), "actual_labor_cost": Decimal(labor),
+        "actual_overhead_cost": Decimal(overhead), "actual_manufacturing_cost": Decimal(total),
+        "work_orders": work_orders or [],
+    }
+
+def _budget_entry(material="0", labor="0", overhead="0", total="0", work_orders=None,
+                   unpriced=None):
+    return {
+        "budget_material_cost": Decimal(material), "budget_labor_cost": Decimal(labor),
+        "budget_overhead_cost": Decimal(overhead), "budget_manufacturing_cost": Decimal(total),
+        "work_orders": work_orders or [], "unpriced_work_orders": unpriced or [],
+    }
+
+def test_contract_variance_computes_actual_minus_budget_per_element():
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {"CONTRACT-A": _actual_entry("100.00", "50", "10.00", "160.00", ["WO-1"])},
+        {"CONTRACT-A": _budget_entry("80.00", "60", "15.00", "155.00", ["WO-1"])},
+    )
+    c = result["CONTRACT-A"]
+    assert c["dm_variance"] == Decimal("20.00")
+    assert c["dl_variance"] == Decimal("-10.00")
+    assert c["oh_variance"] == Decimal("-5.00")
+    assert c["total_variance"] == Decimal("5.00")
+    assert c["actual_manufacturing_cost"] == Decimal("160.00")
+    assert c["budget_manufacturing_cost"] == Decimal("155.00")
+    assert c["unpriced_work_orders"] == []
+    assert c["mismatched_work_orders"] == []
+    assert c["budget_coverage_complete"] is True
+
+def test_contract_variance_includes_all_contracts_from_master():
+    # 4번 정책: contracts 마스터의 모든 계약이 결과에 포함된다(WO가 없어도).
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A"), _variance_contract("CONTRACT-EMPTY")],
+        {"CONTRACT-A": _actual_entry("100.00", "50", "10.00", "160.00", ["WO-1"])},
+        {"CONTRACT-A": _budget_entry("100.00", "50", "10.00", "160.00", ["WO-1"])},
+    )
+    assert set(result.keys()) == {"CONTRACT-A", "CONTRACT-EMPTY"}
+    empty = result["CONTRACT-EMPTY"]
+    assert empty["total_variance"] == Decimal("0")
+    assert empty["budget_coverage_complete"] is True
+
+def test_contract_variance_missing_from_budget_treated_as_zero_budget():
+    # 5번 정책: Budget 쪽에 계약이 없으면 0으로 취급한다.
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {"CONTRACT-A": _actual_entry("100.00", "50", "10.00", "160.00", ["WO-1"])},
+        {},
+    )
+    c = result["CONTRACT-A"]
+    assert c["total_variance"] == Decimal("160.00")
+    # budget 쪽 work_orders가 비어 있으니 WO-1은 mismatched로 표시된다.
+    assert c["mismatched_work_orders"] == ["WO-1"]
+    assert c["budget_coverage_complete"] is False
+
+def test_contract_variance_missing_from_actual_treated_as_zero_actual():
+    # 5번 정책: Actual 쪽에 계약이 없으면 0으로 취급한다.
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {},
+        {"CONTRACT-A": _budget_entry("100.00", "50", "10.00", "160.00", ["WO-1"])},
+    )
+    c = result["CONTRACT-A"]
+    assert c["total_variance"] == Decimal("-160.00")
+    assert c["mismatched_work_orders"] == ["WO-1"]
+    assert c["budget_coverage_complete"] is False
+
+def test_contract_variance_unpriced_work_orders_passthrough_and_coverage_flag():
+    # 7번 정책: unpriced_work_orders가 그대로 전달되고 budget_coverage_complete=False.
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {"CONTRACT-A": _actual_entry("100.00", "0", "0", "100.00", ["WO-1", "WO-2"])},
+        {"CONTRACT-A": _budget_entry("80.00", "0", "0", "80.00", ["WO-1"], unpriced=["WO-2"])},
+    )
+    c = result["CONTRACT-A"]
+    assert c["unpriced_work_orders"] == ["WO-2"]
+    # WO-2는 actual/budget(unpriced 포함) 양쪽에 다 있으므로 mismatched는 아니다.
+    assert c["mismatched_work_orders"] == []
+    assert c["budget_coverage_complete"] is False
+    assert c["total_variance"] == Decimal("20.00")
+
+def test_contract_variance_flags_wo_present_in_actual_but_absent_from_budget_entirely():
+    # 6번 정책: Actual/Budget의 WO 집합이 불일치하면(unpriced에도 없는 경우)
+    # mismatched_work_orders로 표시한다 — 미등록 product WO 비대칭 케이스를 흉내낸다.
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {"CONTRACT-A": _actual_entry("100.00", "0", "0", "100.00", ["WO-1", "WO-999"])},
+        {"CONTRACT-A": _budget_entry("100.00", "0", "0", "100.00", ["WO-1"])},
+    )
+    c = result["CONTRACT-A"]
+    assert c["mismatched_work_orders"] == ["WO-999"]
+    assert c["budget_coverage_complete"] is False
+
+def test_contract_variance_decimal_precision():
+    result = calculate_contract_variance(
+        [_variance_contract("CONTRACT-A")],
+        {"CONTRACT-A": _actual_entry("100.015", "0", "0", "100.015", ["WO-1"])},
+        {"CONTRACT-A": _budget_entry("100.005", "0", "0", "100.005", ["WO-1"])},
+    )
+    # 100.015 - 100.005 = 0.01 정확히, ROUND_HALF_UP 경계 확인은 별도 값으로.
+    c = result["CONTRACT-A"]
+    assert c["dm_variance"] == Decimal("0.01")
+
+
+# --- 실제 Phase 1 데이터 기준 Contract Variance 검증 ---
+
+def _load_real_contract_variance():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    products = rows("07_product_master.xlsx", "product")
+    contracts = rows("30_contract.xlsx", "contract")
+
+    actual_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        products,
+    )
+    actual_by_contract = calculate_actual_total_cost_by_contract(work_orders, actual_by_wo)
+    budget_by_contract = calculate_standard_budget_by_contract(
+        contracts, work_orders, rows("12_standard_cost.xlsx", "standard_cost"), products,
+    )
+    return calculate_contract_variance(contracts, actual_by_contract, budget_by_contract)
+
+def test_real_dataset_contract_variance_001():
+    result = _load_real_contract_variance()
+    if result is None:
+        return
+    c = result["CONTRACT-001"]
+    assert c["dm_variance"] == Decimal("-204219.12")
+    assert c["dl_variance"] == Decimal("-771840.00")
+    assert c["oh_variance"] == Decimal("-578880.00")
+    assert c["total_variance"] == Decimal("-1554939.12")
+    assert c["budget_coverage_complete"] is True
+
+def test_real_dataset_contract_variance_002():
+    result = _load_real_contract_variance()
+    if result is None:
+        return
+    c = result["CONTRACT-002"]
+    assert c["dm_variance"] == Decimal("-19380.00")
+    assert c["dl_variance"] == Decimal("-1263360.00")
+    assert c["oh_variance"] == Decimal("-947520.00")
+    assert c["total_variance"] == Decimal("-2230260.00")
+    assert c["budget_coverage_complete"] is True
+
+def test_real_dataset_contract_variance_003():
+    result = _load_real_contract_variance()
+    if result is None:
+        return
+    c = result["CONTRACT-003"]
+    assert c["dm_variance"] == Decimal("-485682.00")
+    assert c["dl_variance"] == Decimal("-634560.00")
+    assert c["oh_variance"] == Decimal("-475920.00")
+    assert c["total_variance"] == Decimal("-1596162.00")
+    assert c["budget_coverage_complete"] is True

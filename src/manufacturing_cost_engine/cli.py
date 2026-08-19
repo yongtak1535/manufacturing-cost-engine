@@ -17,6 +17,7 @@ from .cost_engine import (
     calculate_material_price_quantity_variance_by_wo,
     calculate_actual_total_cost_by_contract,
     calculate_standard_budget_by_contract,
+    calculate_contract_variance,
 )
 
 def main():
@@ -232,6 +233,16 @@ def main():
         print(f"  {contract_no}: work_orders={v['work_order_count']}, "
               f"DM={v['budget_material_cost']}, DL={v['budget_labor_cost']}, "
               f"OH={v['budget_overhead_cost']}, Total={v['budget_manufacturing_cost']}")
+
+    contract_variance = calculate_contract_variance(
+        contracts, actual_cost_by_contract, budget_by_contract,
+    )
+    print(f"Contract Variance calculated for {len(contract_variance)} contract(s)")
+    for contract_no in sorted(contract_variance):
+        v = contract_variance[contract_no]
+        print(f"  {contract_no}: DM={v['dm_variance']}, DL={v['dl_variance']}, "
+              f"OH={v['oh_variance']}, Total={v['total_variance']}, "
+              f"budget_coverage_complete={v['budget_coverage_complete']}")
 
 if __name__ == "__main__":
     main()
