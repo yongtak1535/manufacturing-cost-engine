@@ -19,6 +19,7 @@ from .cost_engine import (
     calculate_standard_budget_by_contract,
     calculate_contract_variance,
     calculate_actual_direct_expense_by_contract,
+    calculate_ga_by_contract,
 )
 
 def main():
@@ -258,6 +259,20 @@ def main():
         v = de_by_contract[contract_no]
         print(f"  {contract_no}: expenses={v['expense_count']}, "
               f"DE={v['direct_expense_amount']}")
+
+    # 32_cost_rate_rule.xlsx는 아직 저장소에 없다 — 있으면 그대로 읽힌다(하드코딩 없음).
+    rate_rules = rows("32_cost_rate_rule.xlsx", "cost_rate_rule")
+    ga_by_contract = calculate_ga_by_contract(
+        actual_cost_by_contract, budget_by_contract, rate_rules, contracts,
+    )
+    print(f"Contract GA calculated for {len(ga_by_contract)} contract(s)")
+    for contract_no in sorted(ga_by_contract):
+        v = ga_by_contract[contract_no]
+        if v["calculable"]:
+            print(f"  {contract_no}: rate={v['ga_rate']}%, GA_actual={v['ga_actual']}, "
+                  f"GA_budget={v['ga_budget']}, GA_variance={v['ga_variance']}")
+        else:
+            print(f"  {contract_no}: calculable=False, reason={v['reason']}")
 
 if __name__ == "__main__":
     main()

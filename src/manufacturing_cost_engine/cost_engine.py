@@ -1019,3 +1019,157 @@ def calculate_actual_direct_expense_by_contract(
         entry["direct_expense_amount"] = round_amount(entry["direct_expense_amount"])
 
     return result
+
+
+def _resolve_ga_rate(contract, rate_rules):
+    """
+    계약 1건에 적용할 GA rate rule을 고른다. 우선순위(사용자 확정 정책):
+      ① effective_from <= 기준일 <= effective_to (기준일 = contract.start_date)
+      ② contract_type 정확 일치를 전체(contract_type=None) fallback보다 항상 우선
+         (priority 수치보다 먼저 적용된다 — _resolve_gl_account_mapping()의
+         "priority 먼저, 구체성은 동순위 타이브레이커"와는 다른, 이번에 명시적으로
+         확정된 순서다)
+      ③ 정확 일치가 하나도 없으면 전체(None) 후보로 fallback
+      ④ 그 안에서 priority가 가장 높은 것 선택
+      ⑤ 그래도 2건 이상 남으면 모호 상태
+
+    rate_type == "GA"인 행만 후보로 본다(PROFIT 등 다른 rate_type은 이 단계의
+    범위가 아니라 무시한다).
+
+    Returns: (rate_pct: Decimal|None, status: "OK"|"NOT_FOUND"|"AMBIGUOUS", matched_rule: dict|None)
+    rate_pct는 rule에 저장된 그대로의 퍼센트 값이다(예: 8 -> 8%, 100분율 변환은
+    호출자가 한다).
+    """
+    contract_type = contract.get("contract_type")
+    reference_date = contract.get("start_date")
+
+    candidates = [r for r in rate_rules if r.get("rate_type") == "GA"]
+
+    def _in_effective_range(r):
+        if reference_date is None:
+            return True
+        effective_from = r.get("effective_from")
+        effective_to = r.get("effective_to")
+        if effective_from is not None and str(reference_date) < str(effective_from):
+            return False
+        if effective_to is not None and str(reference_date) > str(effective_to):
+            return False
+        return True
+
+    candidates = [r for r in candidates if _in_effective_range(r)]
+    if not candidates:
+        return None, "NOT_FOUND", None
+
+    exact_matches = [r for r in candidates if r.get("contract_type") == contract_type]
+    pool = exact_matches if exact_matches else [
+        r for r in candidates if r.get("contract_type") is None
+    ]
+    if not pool:
+        return None, "NOT_FOUND", None
+
+    def _priority(r):
+        return _strict_decimal(r.get("priority")) or Decimal("0")
+
+    top_priority = max(_priority(r) for r in pool)
+    top = [r for r in pool if _priority(r) == top_priority]
+
+    if len(top) != 1:
+        return None, "AMBIGUOUS", None
+
+    rate_pct = _strict_decimal(top[0].get("rate_pct"))
+    if rate_pct is None:
+        return None, "NOT_FOUND", None
+
+    return rate_pct, "OK", top[0]
+
+
+def calculate_ga_by_contract(
+    actual_by_contract,
+    budget_by_contract,
+    rate_rules,
+    contracts,
+) -> dict[str, dict]:
+    """
+    Phase 2 5단계: contract_no -> {
+        "contract_no", "manufacturing_cost_actual", "manufacturing_cost_budget",
+        "ga_rate", "ga_actual", "ga_budget", "ga_variance", "rate_source",
+        "calculable", "reason",
+    }.
+
+    GA 기준액은 DM+DL+OH(제조원가)만 사용한다 — Direct Expense는 포함하지
+    않는다(사용자 확정 정책). calculate_actual_total_cost_by_contract()와
+    calculate_standard_budget_by_contract()가 이미 계산한 결과 dict를 그대로
+    받아 쓰기만 한다 — 두 함수 자체는 재계산하지도, 수정하지도 않는다.
+
+    GA rate rule(예: 32_cost_rate_rule.xlsx)이 아직 저장소에 없으므로,
+    rate_rules가 빈 리스트로 들어오면 모든 계약이 calculable=False,
+    ga_rate=None으로 나온다 — 0%로 임의 처리하지 않는다("계산 불가"와
+    "0%"는 다른 상태다). rate rule 선택 로직 자체는 _resolve_ga_rate()에
+    있으며, 미래에 실제 rate rule 데이터가 추가되면 그대로 동작한다.
+
+    GA Variance = GA Actual − GA Budget. 이번 단계에서 GA rate가 계약마다
+    다르지 않다면(현재 rate_rules가 비어 있어 검증할 수 없지만, 향후 하나의
+    rate만 있을 경우) 이 Variance는 결국 "동일 rate를 제조원가 차이(Actual−Budget)에
+    곱한 값"과 같다 — 곧, 새로운 가격/능률 차이가 아니라 이미 계산된
+    DM/DL/OH Variance에 비율을 적용한 결과라는 뜻이다. 이는
+    calculate_contract_variance()의 DM/DL/OH variance/total_variance를
+    대체하거나 합산하지 않고 완전히 별도 필드로만 제공한다(중복 없음).
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(calculate_standard_budget_by_contract()와
+    동일한 pre-seeding 정책) — Actual/Budget 어느 쪽에도 없는 계약은 제조원가를
+    0으로 취급한다.
+    """
+    zero = Decimal("0")
+    hundred = Decimal("100")
+
+    result: dict[str, dict] = {}
+    for c in contracts:
+        contract_no = c.get("contract_no")
+        if contract_no is None:
+            continue
+
+        actual_mfg = actual_by_contract.get(contract_no, {}).get(
+            "actual_manufacturing_cost", zero
+        )
+        budget_mfg = budget_by_contract.get(contract_no, {}).get(
+            "budget_manufacturing_cost", zero
+        )
+
+        rate_pct, status, matched_rule = _resolve_ga_rate(c, rate_rules)
+
+        entry = {
+            "contract_no": contract_no,
+            "manufacturing_cost_actual": actual_mfg,
+            "manufacturing_cost_budget": budget_mfg,
+            "ga_rate": rate_pct,
+            "ga_actual": None,
+            "ga_budget": None,
+            "ga_variance": None,
+            "rate_source": None,
+            "calculable": False,
+            "reason": None,
+        }
+
+        if status == "NOT_FOUND":
+            entry["reason"] = (
+                "적용 가능한 GA rate rule이 없습니다(rate rule 데이터 부재 또는 "
+                "이 계약의 contract_type/기준일에 맞는 rule 없음)."
+            )
+        elif status == "AMBIGUOUS":
+            entry["reason"] = (
+                "동일 우선순위의 GA rate rule이 2건 이상이라 하나를 선택할 수 없습니다."
+            )
+        else:
+            entry["calculable"] = True
+            entry["rate_source"] = matched_rule.get("rule_id")
+            rate_fraction = rate_pct / hundred
+            ga_actual = round_amount(actual_mfg * rate_fraction)
+            ga_budget = round_amount(budget_mfg * rate_fraction)
+            entry["ga_actual"] = ga_actual
+            entry["ga_budget"] = ga_budget
+            entry["ga_variance"] = round_amount(ga_actual - ga_budget)
+            entry["reason"] = "OK"
+
+        result[contract_no] = entry
+
+    return result

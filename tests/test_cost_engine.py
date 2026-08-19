@@ -20,6 +20,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_standard_budget_by_contract,
     calculate_contract_variance,
     calculate_actual_direct_expense_by_contract,
+    calculate_ga_by_contract,
 )
 
 
@@ -1428,3 +1429,263 @@ def test_real_dataset_direct_expense_excludes_unassigned_wo_expense():
     all_ids = {eid for c in result.values() for eid in c["expense_ids"]}
     assert "DE-2607-005" not in all_ids
     assert set(result.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}
+
+
+# --- calculate_ga_by_contract (Phase 2 5단계) ---
+#
+# 32_cost_rate_rule.xlsx는 저장소에 실제로 존재하지 않는다. 아래 테스트에서
+# rate_pct="8" 등을 쓰는 것은 전부 [TEST FIXTURE]이며 방산원가 법정 GA율이
+# 아니다 — rate 선택 로직/계산 로직을 합성 데이터로만 검증한다.
+
+def _ga_contract(contract_no="CONTRACT-A", contract_type="MULTI_PRODUCT",
+                  start_date="2026-07-01"):
+    return {
+        "contract_no": contract_no, "contract_type": contract_type,
+        "start_date": start_date,
+    }
+
+def _ga_actual_dict(contract_no="CONTRACT-A", amount="1000000.00"):
+    return {contract_no: {"actual_manufacturing_cost": Decimal(amount)}}
+
+def _ga_budget_dict(contract_no="CONTRACT-A", amount="2000000.00"):
+    return {contract_no: {"budget_manufacturing_cost": Decimal(amount)}}
+
+def _rate_rule(rule_id="RATE-1", contract_type=None, effective_from=None,
+               effective_to=None, rate_pct="8", priority="10", rate_type="GA"):
+    # rate_pct="8" 등은 [TEST FIXTURE] 값이다.
+    return {
+        "rule_id": rule_id, "rate_type": rate_type, "contract_type": contract_type,
+        "effective_from": effective_from, "effective_to": effective_to,
+        "rate_pct": rate_pct, "priority": priority,
+    }
+
+def test_ga_by_contract_pulls_manufacturing_cost_base_from_existing_dicts():
+    # 1. 제조원가 기준액(DM+DL+OH) 계산 — 기존 함수 결과를 그대로 가져오는지 확인.
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "2000000.00"),
+        [],
+        [_ga_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["manufacturing_cost_actual"] == Decimal("1000000.00")
+    assert c["manufacturing_cost_budget"] == Decimal("2000000.00")
+
+def test_ga_by_contract_no_rate_rule_is_not_calculable_not_zero():
+    # 2. rate rule이 전혀 없으면 calculable=False, ga_rate/ga_actual 등은 None
+    #    (0%로 임의 처리하지 않는다).
+    result = calculate_ga_by_contract(
+        _ga_actual_dict(), _ga_budget_dict(), [], [_ga_contract()],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert c["ga_rate"] is None
+    assert c["ga_actual"] is None
+    assert c["ga_budget"] is None
+    assert c["ga_variance"] is None
+    assert "rate rule" in c["reason"] or "rule" in c["reason"]
+
+def test_ga_by_contract_zero_percent_rule_is_calculable():
+    # 3. [TEST FIXTURE] rate_pct=0인 rule이 실제로 존재하면 정상 처리(계산 불가 아님).
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "2000000.00"),
+        [_rate_rule(rate_pct="0")],
+        [_ga_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["ga_rate"] == Decimal("0")
+    assert c["ga_actual"] == Decimal("0.00")
+    assert c["ga_budget"] == Decimal("0.00")
+
+def test_ga_by_contract_exact_contract_type_beats_global_even_with_lower_priority():
+    # 4. contract_type 정확 일치가 전체(fallback)보다 priority 수치와 무관하게
+    #    항상 우선한다([TEST FIXTURE] rate 값).
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [
+            _rate_rule("RATE-GLOBAL", contract_type=None, rate_pct="10", priority="99"),
+            _rate_rule("RATE-EXACT", contract_type="MULTI_PRODUCT", rate_pct="8", priority="1"),
+        ],
+        [_ga_contract("CONTRACT-A", contract_type="MULTI_PRODUCT")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["rate_source"] == "RATE-EXACT"
+    assert c["ga_rate"] == Decimal("8")
+
+def test_ga_by_contract_falls_back_to_global_when_no_exact_match():
+    # 5. 정확 일치가 없으면 전체(contract_type=None) rule로 fallback.
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [_rate_rule("RATE-GLOBAL", contract_type=None, rate_pct="8")],
+        [_ga_contract("CONTRACT-A", contract_type="PROTOTYPE")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["rate_source"] == "RATE-GLOBAL"
+
+def test_ga_by_contract_prefers_higher_priority_within_same_specificity():
+    # 6. 동일 구체성(둘 다 정확 일치) 내에서는 priority가 높은 쪽이 우선.
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [
+            _rate_rule("RATE-LOW", contract_type="MULTI_PRODUCT", rate_pct="5", priority="1"),
+            _rate_rule("RATE-HIGH", contract_type="MULTI_PRODUCT", rate_pct="8", priority="10"),
+        ],
+        [_ga_contract("CONTRACT-A", contract_type="MULTI_PRODUCT")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["rate_source"] == "RATE-HIGH"
+    assert c["ga_rate"] == Decimal("8")
+
+def test_ga_by_contract_effective_date_range_includes_reference_date():
+    # 7. 계약 start_date가 effective_from~to 범위 안이면 적용된다.
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [_rate_rule(effective_from="2026-01-01", effective_to="2026-12-31", rate_pct="8")],
+        [_ga_contract("CONTRACT-A", start_date="2026-07-01")],
+    )
+    assert result["CONTRACT-A"]["calculable"] is True
+
+def test_ga_by_contract_excludes_rule_outside_effective_date_range():
+    # 8. 계약 start_date가 범위 밖이면 그 rule은 후보에서 제외된다(다른 rule이
+    #    없으므로 계산 불가).
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [_rate_rule(effective_from="2025-01-01", effective_to="2025-12-31", rate_pct="8")],
+        [_ga_contract("CONTRACT-A", start_date="2026-07-01")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert c["ga_rate"] is None
+
+def test_ga_by_contract_ambiguous_when_tied_top_priority_candidates():
+    # 9. 동일 구체성·동일 priority인 후보가 2건 이상이면 모호 상태로 처리한다.
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "0"),
+        [
+            _rate_rule("RATE-X", contract_type="MULTI_PRODUCT", rate_pct="8", priority="10"),
+            _rate_rule("RATE-Y", contract_type="MULTI_PRODUCT", rate_pct="9", priority="10"),
+        ],
+        [_ga_contract("CONTRACT-A", contract_type="MULTI_PRODUCT")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert "모호" in c["reason"] or "우선순위" in c["reason"]
+
+def test_ga_by_contract_calculates_ga_actual_and_budget_and_variance():
+    # 10/11/12. GA Actual, GA Budget, GA Variance 계산 ([TEST FIXTURE] rate=8%).
+    result = calculate_ga_by_contract(
+        _ga_actual_dict("CONTRACT-A", "1000000.00"),
+        _ga_budget_dict("CONTRACT-A", "2000000.00"),
+        [_rate_rule(rate_pct="8")],
+        [_ga_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["ga_actual"] == Decimal("80000.00")
+    assert c["ga_budget"] == Decimal("160000.00")
+    assert c["ga_variance"] == Decimal("-80000.00")
+
+def test_ga_by_contract_independent_of_contract_variance():
+    # 13. calculate_contract_variance()의 DM/DL/OH variance/total_variance는
+    #     GA 계산과 완전히 분리되어 서로 영향을 주지 않는다.
+    actual_by_contract = {
+        "CONTRACT-A": {
+            "actual_material_cost": Decimal("100.00"), "actual_labor_cost": Decimal("50"),
+            "actual_overhead_cost": Decimal("10.00"), "actual_manufacturing_cost": Decimal("160.00"),
+            "work_orders": ["WO-1"],
+        }
+    }
+    budget_by_contract = {
+        "CONTRACT-A": {
+            "budget_material_cost": Decimal("80.00"), "budget_labor_cost": Decimal("60"),
+            "budget_overhead_cost": Decimal("15.00"), "budget_manufacturing_cost": Decimal("155.00"),
+            "work_orders": ["WO-1"], "unpriced_work_orders": [],
+        }
+    }
+    variance = calculate_contract_variance(
+        [_ga_contract("CONTRACT-A")], actual_by_contract, budget_by_contract,
+    )
+    ga = calculate_ga_by_contract(
+        actual_by_contract, budget_by_contract, [_rate_rule(rate_pct="8")],
+        [_ga_contract("CONTRACT-A")],
+    )
+    # 기존 Contract Variance 필드는 GA 계산 호출 전후로 그대로다.
+    assert variance["CONTRACT-A"]["total_variance"] == Decimal("5.00")
+    assert "ga_variance" not in variance["CONTRACT-A"]
+    assert "total_variance" not in ga["CONTRACT-A"]
+    assert ga["CONTRACT-A"]["ga_variance"] == Decimal("0.40")
+
+
+# --- 실제 Phase 2 데이터 기준 GA 검증 ---
+
+def _load_real_ga():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    products = rows("07_product_master.xlsx", "product")
+    contracts = rows("30_contract.xlsx", "contract")
+
+    actual_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        products,
+    )
+    actual_by_contract = calculate_actual_total_cost_by_contract(work_orders, actual_by_wo)
+    budget_by_contract = calculate_standard_budget_by_contract(
+        contracts, work_orders, rows("12_standard_cost.xlsx", "standard_cost"), products,
+    )
+    # 32_cost_rate_rule.xlsx는 저장소에 없다 — 실제 로더 호출 결과가 곧 빈 리스트다.
+    rate_rules = rows("32_cost_rate_rule.xlsx", "cost_rate_rule")
+    return calculate_ga_by_contract(actual_by_contract, budget_by_contract, rate_rules, contracts), \
+        actual_by_contract, budget_by_contract
+
+def test_real_dataset_ga_not_calculable_without_rate_rule_file():
+    # 14. 실제 데이터에는 rate rule 파일이 없으므로 3개 계약 모두 calculable=False여야
+    #     한다 — 제조원가 기준액 자체는 기존 함수 결과와 정확히 일치해야 한다.
+    result = _load_real_ga()
+    if result is None:
+        return
+    ga_by_contract, actual_by_contract, budget_by_contract = result
+
+    assert set(ga_by_contract.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}
+    for contract_no in ga_by_contract:
+        c = ga_by_contract[contract_no]
+        assert c["calculable"] is False
+        assert c["ga_rate"] is None
+        assert c["ga_actual"] is None
+        assert c["reason"] is not None
+
+        assert c["manufacturing_cost_actual"] == actual_by_contract[contract_no]["actual_manufacturing_cost"]
+        assert c["manufacturing_cost_budget"] == budget_by_contract[contract_no]["budget_manufacturing_cost"]
+
+    # CONTRACT-001/002/003의 실제 제조원가 기준액(기존에 이미 검증된 값)까지 재확인.
+    assert ga_by_contract["CONTRACT-001"]["manufacturing_cost_actual"] == Decimal("1817220.88")
+    assert ga_by_contract["CONTRACT-001"]["manufacturing_cost_budget"] == Decimal("3372160.00")
+    assert ga_by_contract["CONTRACT-002"]["manufacturing_cost_actual"] == Decimal("1257612.00")
+    assert ga_by_contract["CONTRACT-002"]["manufacturing_cost_budget"] == Decimal("3487872.00")
+    assert ga_by_contract["CONTRACT-003"]["manufacturing_cost_actual"] == Decimal("0")
+    assert ga_by_contract["CONTRACT-003"]["manufacturing_cost_budget"] == Decimal("1596162.00")
