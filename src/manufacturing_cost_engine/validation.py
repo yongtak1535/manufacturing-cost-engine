@@ -225,6 +225,36 @@ def _index_bom_items(bom_items):
         entry["uom"] = item.get("uom")
     return index
 
+def _index_uom_conversions(uom_conversions):
+    """
+    (material_code, from_uom, to_uom) -> Decimal factor.
+    전역 환산(자재무관)은 material_code=None으로 저장한다.
+    factor가 없거나 숫자로 변환되지 않는 행은 저장하지 않는다(조회 시 None과 동일하게 처리됨).
+    """
+    index = {}
+    for r in uom_conversions:
+        from_uom = r.get("from_uom")
+        to_uom = r.get("to_uom")
+        if from_uom is None or to_uom is None:
+            continue
+        factor = _to_decimal(r.get("conversion_factor"))
+        if factor is None:
+            continue
+        index[(r.get("material_code"), from_uom, to_uom)] = factor
+    return index
+
+def _resolve_uom_conversion_factor(material_code, from_uom, to_uom, conversion_index):
+    """
+    phase1_dataset_design.md §7-12: "자재별 환산이 전역 환산보다 우선".
+    자재별 환산이 있으면 그것을 쓰고, 없으면 전역(material_code=None) 환산을 쓴다.
+    둘 다 없으면(또는 factor 자체가 없으면) None — 호출자가 UOM_CONVERSION_MISSING으로 처리한다.
+    1단계 직접 환산만 지원한다(연쇄 환산 미지원, §7-12).
+    """
+    material_specific = conversion_index.get((material_code, from_uom, to_uom))
+    if material_specific is not None:
+        return material_specific
+    return conversion_index.get((None, from_uom, to_uom))
+
 def _index_material_issues(material_issues):
     """wo_no -> material_code -> {"qty": Decimal, "uoms": set, "last_row": int|None}"""
     index = defaultdict(dict)
@@ -248,15 +278,22 @@ def _index_material_issues(material_issues):
     return index
 
 def validate_bom_issues(work_orders, bom_items, material_issues, materials,
-                        file="22_material_issue.xlsx", sheet="material_issue"):
+                        uom_conversions=(), file="22_material_issue.xlsx",
+                        sheet="material_issue"):
     """
     WO의 bom_version_id 기준 BOM 표준투입량과 material_issue 순출고량(ISSUE-RETURN)을
     비교해 tolerance를 벗어나면 BOM_ISSUE를 생성한다.
     BOM 미등재 자재(expected=0)와 미출고 자재(actual=0)도 동일 경로로 판정한다.
+
+    BOM uom과 issue uom이 다르면(그리고 issue uom이 한 종류로 일관될 때) 먼저
+    06_uom_conversion.xlsx에서 환산계수를 찾아 적용한다(자재별 환산이 전역 환산보다
+    우선, §7-12). 환산계수를 찾지 못하면(행 자체가 없거나 factor가 비어 있으면)
+    기존과 동일하게 UOM_CONVERSION_MISSING을 보고하고 BOM_ISSUE 비교는 건너뛴다.
     """
     issues = []
     bom_index = _index_bom_items(bom_items)
     issue_index = _index_material_issues(material_issues)
+    conversion_index = _index_uom_conversions(uom_conversions)
     material_uom = {
         m.get("material_code"): m.get("base_uom")
         for m in materials if m.get("material_code")
@@ -278,21 +315,31 @@ def validate_bom_issues(work_orders, bom_items, material_issues, materials,
             bom_uom = bom_entry["uom"] if bom_entry else None
             issue_uoms = issue_entry["uoms"] if issue_entry else set()
             source_row = issue_entry["last_row"] if issue_entry else None
+            actual_qty = issue_entry["qty"] if issue_entry else Decimal("0")
 
             if bom_uom is not None and issue_uoms and issue_uoms != {bom_uom}:
-                base_uom = material_uom.get(material_code)
-                issues.append(_issue(
-                    "UOM_CONVERSION_MISSING", "REVIEW_REQUIRED", file, sheet,
-                    source_row,
-                    f"WO={wo_no}, material={material_code}: BOM UOM={bom_uom}, "
-                    f"Issue UOM={','.join(sorted(issue_uoms))}, "
-                    f"base_uom={base_uom} 기준 환산 불가",
-                    material_code
-                ))
-                continue
+                factor = None
+                if len(issue_uoms) == 1:
+                    (issue_uom,) = issue_uoms
+                    factor = _resolve_uom_conversion_factor(
+                        material_code, issue_uom, bom_uom, conversion_index
+                    )
+
+                if factor is None:
+                    base_uom = material_uom.get(material_code)
+                    issues.append(_issue(
+                        "UOM_CONVERSION_MISSING", "REVIEW_REQUIRED", file, sheet,
+                        source_row,
+                        f"WO={wo_no}, material={material_code}: BOM UOM={bom_uom}, "
+                        f"Issue UOM={','.join(sorted(issue_uoms))}, "
+                        f"base_uom={base_uom} 기준 환산 불가",
+                        material_code
+                    ))
+                    continue
+
+                actual_qty = actual_qty * factor
 
             expected_qty = (bom_entry["qty"] * planned_qty) if bom_entry else Decimal("0")
-            actual_qty = issue_entry["qty"] if issue_entry else Decimal("0")
             difference = actual_qty - expected_qty
             tolerance = _bom_tolerance(material_code, expected_qty)
 

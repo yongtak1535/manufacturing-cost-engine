@@ -240,6 +240,110 @@ def test_bom_issue_uses_decimal_and_respects_tolerance_boundary():
     assert issues == []
 
 
+def _uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
+                     conversion_factor="12.5"):
+    return {
+        "material_code": material_code, "from_uom": from_uom, "to_uom": to_uom,
+        "conversion_factor": conversion_factor,
+    }
+
+def test_bom_issue_applies_material_specific_uom_conversion_within_tolerance():
+    # 실제 MAT-003(EA->KG, factor=12.5)과 동일한 패턴: 환산 후 tolerance 이내면
+    # UOM_CONVERSION_MISSING이 아니라 정상적으로 BOM_ISSUE 비교가 이뤄져야 한다.
+    # BOM 표준: 2KG x planned_qty(1) = 2KG. 출고 0.16EA x 12.5 = 2.0KG -> 정확히 일치.
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-3", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-3", material_code="MAT-003",
+                   standard_qty="2", uom="KG")],
+        [_issue_row(material_code="MAT-003", issued_qty="0.16", uom="EA")],
+        [_material(material_code="MAT-003", base_uom="KG")],
+        [_uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
+                          conversion_factor="12.5")],
+    )
+    assert issues == []
+
+def test_bom_issue_applies_uom_conversion_and_still_flags_when_over_tolerance():
+    # 환산은 되지만 환산된 수량이 tolerance를 벗어나면 여전히 BOM_ISSUE가 발생해야 한다.
+    # BOM 표준: 2KG. 출고 1EA x 12.5 = 12.5KG -> 크게 초과.
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-3", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-3", material_code="MAT-003",
+                   standard_qty="2", uom="KG")],
+        [_issue_row(material_code="MAT-003", issued_qty="1", uom="EA")],
+        [_material(material_code="MAT-003", base_uom="KG")],
+        [_uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
+                          conversion_factor="12.5")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "BOM_ISSUE"
+    assert "actual=12.5" in issues[0].message
+
+def test_bom_issue_uses_global_conversion_when_no_material_specific_row():
+    # 자재별 환산 행이 없으면 전역(material_code=None) 환산을 사용한다.
+    # BOM 1L = 1000mL. 출고 1000mL -> 정확히 일치(변환 후 1L).
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-4", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-4", material_code="MAT-009",
+                   standard_qty="1", uom="L")],
+        [_issue_row(material_code="MAT-009", issued_qty="1000", uom="ML")],
+        [_material(material_code="MAT-009", base_uom="L")],
+        [_uom_conversion(material_code=None, from_uom="ML", to_uom="L",
+                          conversion_factor="0.001")],
+    )
+    assert issues == []
+
+def test_bom_issue_material_specific_conversion_takes_priority_over_global():
+    # 동일 (from_uom, to_uom)에 자재별 행과 전역 행이 둘 다 있으면 자재별이 우선한다(§7-12).
+    # 전역 factor(1)를 쓰면 불일치, 자재별 factor(12.5)를 쓰면 정확히 일치해야 한다.
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-3", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-3", material_code="MAT-003",
+                   standard_qty="2", uom="KG")],
+        [_issue_row(material_code="MAT-003", issued_qty="0.16", uom="EA")],
+        [_material(material_code="MAT-003", base_uom="KG")],
+        [
+            _uom_conversion(material_code=None, from_uom="EA", to_uom="KG",
+                              conversion_factor="1"),
+            _uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
+                              conversion_factor="12.5"),
+        ],
+    )
+    assert issues == []
+
+def test_bom_issue_null_conversion_factor_still_reports_uom_conversion_missing():
+    # 실제 MAT-004처럼 uom_conversion에 행은 있지만 factor가 비어 있으면(NaN->None)
+    # 환산 불가로 처리해 기존과 동일하게 UOM_CONVERSION_MISSING을 보고해야 한다.
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-3", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-3", material_code="MAT-004",
+                   standard_qty="1.8", uom="KG")],
+        [_issue_row(material_code="MAT-004", issued_qty="5", uom="EA")],
+        [_material(material_code="MAT-004", base_uom="KG")],
+        [_uom_conversion(material_code="MAT-004", from_uom="EA", to_uom="KG",
+                          conversion_factor=None)],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UOM_CONVERSION_MISSING"
+
+def test_bom_issue_mixed_issue_uoms_still_reports_uom_conversion_missing():
+    # 동일 WO+자재에 서로 다른 issue uom이 섞여 있으면(합계 수량의 단위가 모호해짐)
+    # 환산계수가 있어도 시도하지 않고 안전하게 UOM_CONVERSION_MISSING으로 처리한다.
+    issues = validate_bom_issues(
+        [_wo(bom_version_id="BOM-3", planned_qty="1")],
+        [_bom_item(bom_version_id="BOM-3", material_code="MAT-003",
+                   standard_qty="2", uom="KG")],
+        [
+            _issue_row(material_code="MAT-003", issued_qty="0.1", uom="EA", source_row=2),
+            _issue_row(material_code="MAT-003", issued_qty="1", uom="KG", source_row=3),
+        ],
+        [_material(material_code="MAT-003", base_uom="KG")],
+        [_uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
+                          conversion_factor="12.5")],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "UOM_CONVERSION_MISSING"
+
+
 def _routing_version(routing_version_id="RTG-P100-A", product_code="P-100",
                       revision="A", source_row=2):
     return {

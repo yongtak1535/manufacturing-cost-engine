@@ -47,6 +47,7 @@ def main():
         rows("10_bom.xlsx", "bom_item"),
         rows("22_material_issue.xlsx", "material_issue"),
         rows("08_material_master.xlsx", "material"),
+        rows("06_uom_conversion.xlsx", "uom_conversion"),
     )
 
     issues += validate_bom_version(rows("10_bom.xlsx", "bom_version"))
