@@ -1345,3 +1345,457 @@ def calculate_budget_direct_expense_by_contract(
             }
 
     return result
+
+
+# ============================================================================
+# Phase 2 8단계: GA 규정 정합 계산 구조 (준비 단계, 아직 활성화하지 않음)
+#
+# 이 구획의 함수들은 기존 calculate_ga_by_contract()/_resolve_ga_rate()를
+# 대체하지 않는다 — 그 둘은 그대로 보존되며 CLI도 여전히 그 결과만 출력한다.
+# 여기 함수들은 "규정에 맞는 계산 구조"만 준비하는 것이며, 아래는 전부
+# 실제 rate/관급재료비 데이터가 없는 상태에서도 None/미계산으로 안전하게
+# 동작하도록 설계했다 — 어떤 수치도 임의로 채우지 않는다.
+# ============================================================================
+
+
+def calculate_ga_base_amount(
+    manufacturing_cost_excluding_government_material,
+    government_furnished_material,
+    calculation_basis,
+):
+    """
+    GA 기준액(ga_base_amount)을 계산하는 순수 함수.
+
+    제조원가는 반드시 DM+DL+DE+OH(관급재료비 제외)로 정의된 값을 받는다
+    (이 함수 자체는 그 합산을 하지 않는다 — 호출자가 이미 합산해서 넘긴다).
+
+    calculation_basis:
+      - "EXCLUDE_GFM": 기준액 = manufacturing_cost_excluding_government_material 그대로.
+        관급재료비 값을 아예 쓰지 않으므로 관급재료비가 None이어도 계산된다.
+      - "INCLUDE_GFM": 기준액 = manufacturing_cost_excluding_government_material +
+        government_furnished_material. 관급재료비가 None(데이터 없음)이면
+        전체 결과도 None이다 — **0으로 대체하지 않는다**(관급재료비 데이터
+        부재를 0원으로 취급하면 실제보다 기준액이 커져 GA가 과대/과소 계산될
+        위험이 있다).
+      - 그 외 알 수 없는 값: None(계산 불가) — 임의로 추정하지 않는다.
+
+    manufacturing_cost_excluding_government_material 자체가 None이면 항상
+    None을 반환한다(기준 자체가 없으므로 계산 불가 상태를 그대로 전파한다).
+    """
+    if manufacturing_cost_excluding_government_material is None:
+        return None
+
+    if calculation_basis == "EXCLUDE_GFM":
+        return manufacturing_cost_excluding_government_material
+
+    if calculation_basis == "INCLUDE_GFM":
+        if government_furnished_material is None:
+            return None
+        return manufacturing_cost_excluding_government_material + government_furnished_material
+
+    return None
+
+
+def _in_ga_rate_effective_range(rule, reference_date):
+    """
+    기준일이 rule의 [effective_from, effective_to] 안(양끝 포함)에 있는지
+    판정한다.
+
+    effective_from 또는 effective_to 중 하나라도 None이면 이 rule을
+    "무기한 유효"로 간주하지 않고 후보에서 제외한다(False를 반환) — 이는
+    새로 지어낸 규칙이 아니라, 이미 이 코드베이스가 BOM 버전 유효기간
+    비교(validation.py의 _bom_date_ranges_overlap())에서 쓰고 있는 것과
+    동일한 방어적 관례다: 거기서도 두 구간 중 어느 한쪽 끝이라도 None이면
+    "겹치지 않는다"고 보수적으로 판정하지, None을 무한대로 취급하지 않는다.
+    실제 데이터에서 "무기한"을 표현하려면(예: 10_bom.xlsx의 ACTIVE 버전들이
+    effective_to=2099-12-31처럼 먼 미래의 명시적 날짜를 쓰는 것) 이 프로젝트의
+    기존 관례이며, None을 그 의미로 대신 쓰지 않는다.
+
+    날짜는 이 프로젝트 전반의 관례(_bom_date_ranges_overlap(),
+    _is_period_spanning() 등)와 동일하게 ISO 8601 문자열 그대로 비교한다.
+    별도의 날짜 형식 검증/파싱 실패 처리는 기존 코드 어디에도 없어(전부
+    문자열 비교로만 판정) 이번에도 새로 만들지 않는다 — 이 프로젝트는
+    "형식이 잘못된 날짜"를 별도 invalid 상태로 다루는 선례가 없다.
+
+    [알려진 한계 — 코드 변경 없이 기록만 해둠]
+    - 이 null-bound-제외 정책은 32_cost_rate_rule.xlsx의 "공식" 데이터
+      모델이 아직 존재하지 않는 상태에서 BOM 버전 유효기간(10_bom.xlsx)
+      선례 하나에만 근거해 보수적으로 정한 것이다. GA rate rule의 실제
+      스키마가 확정되면(예: "무기한"을 null이 아니라 BOM처럼 2099-12-31
+      같은 명시적 far-future sentinel로 표현하는 관례를 그대로 따를지) 이
+      정책을 재검토해야 한다.
+    - 현재 실제 데이터셋의 모든 날짜 컬럼은 텍스트 셀(plain "YYYY-MM-DD"
+      문자열)로 저장되어 있어 str() 비교가 안전하다(loader.py는 셀 값을
+      변환 없이 그대로 통과시킨다). 그러나 만약 향후 32_cost_rate_rule.xlsx
+      가 실제 Excel 날짜형 셀로 채워진다면 로더가 datetime 객체를 돌려줄
+      수 있고, str(datetime(...))은 "2026-01-01 00:00:00"처럼 시간까지
+      붙어 순수 "YYYY-MM-DD" 기준일 문자열과의 경계값(등호) 비교가 깨질
+      수 있다 — 이 코드는 이 경우를 방어하지 않는다.
+    """
+    effective_from = rule.get("effective_from")
+    effective_to = rule.get("effective_to")
+    if effective_from is None or effective_to is None:
+        return False
+    return str(effective_from) <= str(reference_date) <= str(effective_to)
+
+
+def resolve_ga_actual_rate(rate_rules, company_code, plant_code, fiscal_year, reference_date):
+    """
+    실적 기반 GA 요율(ACTUAL) 조회 — (company_code, plant_code, fiscal_year)
+    정확 일치 + reference_date가 그 행의 [effective_from, effective_to]
+    안에 있는 행만 후보로 삼는다. contract_type은 이 조회에 전혀 관여하지
+    않는다(기존 _resolve_ga_rate()와 완전히 분리된 별도 축).
+
+    reference_date는 호출자가 명시적으로 전달해야 한다 — 이 함수는 현재
+    날짜를 스스로 조회하지 않는다(datetime.now() 등을 쓰지 않음). fiscal_year
+    (산정연도 식별자)와 effective_from/effective_to(그 rule의 실제 효력기간)는
+    서로 다른 개념이므로 섞어서 판단하지 않는다: fiscal_year는 정확 일치로만
+    후보를 좁히고, 그 다음 완전히 별도로 effective 기간을 검사한다
+    (_in_ga_rate_effective_range).
+
+    plant_code가 법적 "부문"과 동일하다고 이 함수가 단정하지 않는다 —
+    현재 30_contract.xlsx에는 plant_code/fiscal_year 컬럼이 없어 실제
+    데이터로 호출하면 사실상 항상 None이 들어와 조회 결과도 None이 된다.
+    이는 이번 단계에서 새 컬럼을 추가하지 않기로 한 결정에 따른 의도된
+    동작이며, 계산 비활성 상태를 그대로 반영한다.
+
+    rate_type="GA", rate_kind="ACTUAL"인 행만 후보로 삼는다. priority가
+    없으므로(이번 설계에서 제외) 정확히 1건만 매칭되어야 하며, 0건이거나
+    2건 이상(모호 — 예: 유효기간이 겹치는 두 rule이 기준일에 동시에 유효한
+    경우)이면 (None, None)을 반환한다 — 임의로 하나를 고르지 않는다.
+
+    Returns: (rate_pct: Decimal|None, matched_rule: dict|None)
+    """
+    if (
+        company_code is None or plant_code is None
+        or fiscal_year is None or reference_date is None
+    ):
+        return None, None
+
+    candidates = [
+        r for r in rate_rules
+        if r.get("rate_type") == "GA"
+        and r.get("rate_kind") == "ACTUAL"
+        and r.get("company_code") == company_code
+        and r.get("plant_code") == plant_code
+        and r.get("fiscal_year") == fiscal_year
+        and _in_ga_rate_effective_range(r, reference_date)
+    ]
+    if len(candidates) != 1:
+        return None, None
+
+    rate_pct = _strict_decimal(candidates[0].get("rate_pct"))
+    if rate_pct is None:
+        return None, None
+
+    return rate_pct, candidates[0]
+
+
+def resolve_ga_ceiling_rate(rate_rules, industry_type, company_size, reference_date):
+    """
+    GA 상한율(CEILING) 조회 — (industry_type, company_size) 정확 일치 +
+    reference_date가 그 행의 [effective_from, effective_to] 안에 있는 행만
+    후보로 삼는다. company_code/plant_code/fiscal_year는 이 조회와 무관하다
+    (실적요율 축과 완전히 분리된 별도 축 — 실적요율과 상한을 하나의
+    contract_type 기반 매칭으로 뒤섞지 않는다).
+
+    reference_date는 호출자가 명시적으로 전달해야 한다(resolve_ga_actual_rate와
+    동일한 원칙). effective 기간 판정 규칙(None 처리, 문자열 비교)도
+    resolve_ga_actual_rate와 완전히 동일하다(_in_ga_rate_effective_range 공유).
+
+    현재 30_contract.xlsx에는 industry_type/company_size 컬럼이 없어
+    실제 데이터로 호출하면 항상 None이 들어와 조회 결과도 None이 된다
+    (의도된 동작 — §resolve_ga_actual_rate와 동일한 이유).
+
+    rate_type="GA", rate_kind="CEILING"인 행만 후보로 삼는다. 정확히 1건만
+    매칭되어야 하며, 0건이거나 2건 이상이면 (None, None)을 반환한다.
+
+    Returns: (rate_pct: Decimal|None, matched_rule: dict|None)
+    """
+    if industry_type is None or company_size is None or reference_date is None:
+        return None, None
+
+    candidates = [
+        r for r in rate_rules
+        if r.get("rate_type") == "GA"
+        and r.get("rate_kind") == "CEILING"
+        and r.get("industry_type") == industry_type
+        and r.get("company_size") == company_size
+        and _in_ga_rate_effective_range(r, reference_date)
+    ]
+    if len(candidates) != 1:
+        return None, None
+
+    rate_pct = _strict_decimal(candidates[0].get("rate_pct"))
+    if rate_pct is None:
+        return None, None
+
+    return rate_pct, candidates[0]
+
+
+def calculate_regulatory_ga_by_contract(
+    actual_by_contract,
+    budget_by_contract,
+    actual_direct_expense_by_contract,
+    budget_direct_expense_by_contract,
+    government_furnished_material_by_contract,
+    rate_rules,
+    contracts,
+    calculation_basis,
+    reference_date,
+) -> dict[str, dict]:
+    """
+    calculate_ga_by_contract()와 나란히 존재하는 "규정 정합 구조" 버전이다
+    (기존 함수는 수정하지 않았고, CLI도 여전히 기존 함수만 호출한다 — 이
+    함수는 아직 어디에도 연결되지 않은 준비 단계 코드다).
+
+    기존 함수와의 핵심 차이:
+      1. GA 기준액에 직접경비(DE)를 포함한다 — manufacturing_cost_excluding_
+         government_material = DM+DL+OH(actual_by_contract/budget_by_contract) +
+         DE(actual_direct_expense_by_contract/budget_direct_expense_by_contract).
+         Budget DE가 계산 불가(calculable=False)면 예산 쪽 기준액 전체가
+         None이 된다(0으로 대체하지 않음).
+      2. 관급재료비(government_furnished_material_by_contract)를
+         calculate_ga_base_amount()로 조합한다 — 외부에서 주어지는 dict이며
+         이 함수는 관급재료비를 스스로 계산하지 않는다(§6 정책).
+      3. rate 조회를 resolve_ga_actual_rate()(실적, company+plant+fiscal_year+
+         reference_date)와 resolve_ga_ceiling_rate()(상한, industry_type+
+         company_size+reference_date)로 완전히 분리한다. 두 축의 매칭 키는
+         contract 행에서 그대로 읽는다(contract.get("plant_code") 등) —
+         현재 30_contract.xlsx에는 이 컬럼들이 없으므로 실제 데이터로는
+         항상 None이 되어 두 조회 모두 (None, None)이 된다. 이는 §3에서
+         이미 확인된 데이터 격차이며, 이번 단계에서 그 컬럼을 새로 추가하지
+         않는다.
+      4. reference_date는 이 함수가 스스로 정하지 않는다(현재 날짜나
+         contract.get("start_date") 등을 내부에서 임의로 쓰지 않음) — 호출자가
+         명시적으로 전달해야 한다. "언제를 기준으로 GA 요율을 조회할
+         것인가"는 사전원가/확정원가 산정 시점처럼 업무 프로세스가 결정할
+         문제이고, 계약 데이터의 특정 필드에서 자동으로 추론할 성격이
+         아니라고 판단했다 — 이 판단의 근거는 이 함수 하단의 별도 설명을
+         참고한다.
+
+         Actual 쪽 GA(ga_actual)와 Budget 쪽 GA(ga_budget) 계산에는 동일한
+         reference_date로 조회한 동일한 실적요율을 그대로 재사용한다(기존
+         calculate_ga_by_contract()와 동일한 계산 패턴 유지). 즉: 현재
+         규정 조사에서 Actual/Budget에 서로 다른 GA 적용시점을 확정할
+         근거가 없어 동일 기준일을 사용한다 — 방산원가 규정/지침에서
+         사전원가와 정산원가의 GA 적용시점이 실제로 다르다는 근거가 아직
+         확보되지 않았기 때문이다. actual_rate_reference_date/
+         budget_rate_reference_date처럼 두 시점을 분리하는 인터페이스로
+         확장하는 방안을 검토했으나, 그 근거가 없는 현재로서는 단일
+         reference_date를 두 계산에 공유하는 것으로 유지한다(이 함수
+         하단의 별도 설명 참고). 이 함수는 아직 CLI에 연결되지 않았으므로
+         향후 그 근거가 확보되면 기존 호출자를 깨지 않고(추가 파라미터로)
+         확장할 수 있다.
+      5. 상한 초과 여부(exceeds_ceiling)는 참고용으로만 계산해 노출한다 —
+         "실적요율이 상한을 넘으면 상한으로 대체한다"는 식의 정책은 아직
+         확정되지 않았으므로(§C, 미해결) ga_actual/ga_budget 계산에는
+         반영하지 않는다.
+
+    calculable=True는 GA 기준액(Actual)과 실적요율(ACTUAL) 둘 다 확보된
+    경우에만 True다. 그 외에는 계산 불가로 남고 reason에 사유를 남긴다.
+    """
+    zero = Decimal("0")
+    hundred = Decimal("100")
+
+    result: dict[str, dict] = {}
+    for c in contracts:
+        contract_no = c.get("contract_no")
+        if contract_no is None:
+            continue
+
+        actual_mfg = actual_by_contract.get(contract_no, {}).get(
+            "actual_manufacturing_cost", zero
+        )
+        actual_de = actual_direct_expense_by_contract.get(contract_no, {}).get(
+            "direct_expense_amount", zero
+        )
+        mfg_excl_gfm_actual = actual_mfg + actual_de
+
+        budget_mfg = budget_by_contract.get(contract_no, {}).get(
+            "budget_manufacturing_cost", zero
+        )
+        budget_de_entry = budget_direct_expense_by_contract.get(contract_no, {})
+        if budget_de_entry.get("calculable"):
+            mfg_excl_gfm_budget = budget_mfg + budget_de_entry.get("budget_direct_expense")
+        else:
+            mfg_excl_gfm_budget = None
+
+        gfm = government_furnished_material_by_contract.get(contract_no)
+
+        ga_base_actual = calculate_ga_base_amount(
+            mfg_excl_gfm_actual, gfm, calculation_basis
+        )
+        ga_base_budget = calculate_ga_base_amount(
+            mfg_excl_gfm_budget, gfm, calculation_basis
+        )
+
+        actual_rate, actual_rule = resolve_ga_actual_rate(
+            rate_rules,
+            c.get("company_code"),
+            c.get("plant_code"),
+            c.get("fiscal_year"),
+            reference_date,
+        )
+        ceiling_rate, _ = resolve_ga_ceiling_rate(
+            rate_rules, c.get("industry_type"), c.get("company_size"), reference_date
+        )
+
+        exceeds_ceiling = None
+        if actual_rate is not None and ceiling_rate is not None:
+            exceeds_ceiling = actual_rate > ceiling_rate
+
+        entry = {
+            "contract_no": contract_no,
+            "manufacturing_cost_excluding_government_material_actual": mfg_excl_gfm_actual,
+            "manufacturing_cost_excluding_government_material_budget": mfg_excl_gfm_budget,
+            "government_furnished_material": gfm,
+            "calculation_basis": calculation_basis,
+            "ga_base_amount_actual": ga_base_actual,
+            "ga_base_amount_budget": ga_base_budget,
+            "actual_rate": actual_rate,
+            "rate_source": actual_rule.get("rule_id") if actual_rule else None,
+            "ceiling_rate": ceiling_rate,
+            "exceeds_ceiling": exceeds_ceiling,
+            "ga_actual": None,
+            "ga_budget": None,
+            "ga_variance": None,
+            "calculable": False,
+            "reason": None,
+        }
+
+        if ga_base_actual is None:
+            entry["reason"] = (
+                "GA 기준액(Actual)을 계산할 수 없습니다 "
+                "(제조원가 또는 관급재료비 데이터 부재)."
+            )
+        elif actual_rate is None:
+            entry["reason"] = (
+                "적용 가능한 GA 실적요율(ACTUAL rate)이 없습니다 "
+                "(rate rule 데이터 부재, company_code/plant_code/fiscal_year 불일치, "
+                "또는 reference_date가 유효기간[effective_from, effective_to] 밖입니다)."
+            )
+        else:
+            entry["calculable"] = True
+            entry["reason"] = "OK"
+            rate_fraction = actual_rate / hundred
+            ga_actual = round_amount(ga_base_actual * rate_fraction)
+            entry["ga_actual"] = ga_actual
+            if ga_base_budget is not None:
+                ga_budget = round_amount(ga_base_budget * rate_fraction)
+                entry["ga_budget"] = ga_budget
+                entry["ga_variance"] = round_amount(ga_actual - ga_budget)
+
+        result[contract_no] = entry
+
+    return result
+
+
+def calculate_government_furnished_material_by_contract(
+    contracts,
+    work_orders,
+    material_issues,
+) -> dict[str, dict]:
+    """
+    Phase 2 GA 규정 정합 구조 준비: contract_no -> 관급재료비(GFM) 집계.
+
+    22_material_issue.xlsx에 이번 단계에서 추가한 supply_type(관급/사급 구분)
+    컬럼을 기준으로, wo_no -> work_order.contract_no 경로를 통해 계약 단위로
+    집계한다. 현재 실제 데이터에는 supply_type 값이 전혀 채워져 있지 않으므로
+    (이번 단계는 스키마 추가만 결정했고 임의로 GOVERNMENT/COMPANY 기본값을
+    채우지 않았다), 실제 데이터로 호출하면 모든 계약이 calculable=False로
+    남는다 — 이는 의도된 동작이며 계산 비활성 상태를 그대로 반영한다.
+
+    "계산 불가 ≠ 0" 원칙: 어떤 계약에 귀속되는 material_issue 행 중 단 하나
+    라도 supply_type이 None(미분류)이면, 그 행이 실제로 관급인지 사급인지
+    알 수 없으므로 그 계약 전체의 GFM을 계산 불가(calculable=False,
+    gfm_amount=None)로 남긴다 — 미분류 행을 "사급(관급 아님, 즉 0에 기여)"로
+    임의 간주하지 않는다.
+
+    supply_type == "GOVERNMENT"인 행만 금액에 더한다(issued_qty × unit_cost,
+    issue_type == "RETURN"이면 차감 — calculate_actual_material_cost()와
+    동일한 계산 규칙). "GOVERNMENT"가 아닌 다른 명시적 값(예: "COMPANY")은
+    계산 불가 판정에 영향을 주지 않고 금액에는 0으로 기여한다.
+
+    material_code가 material master에 등록되어 있는지, issued_qty/unit_cost가
+    숫자로 파싱되는지는 이 함수의 관심사가 아니다(validate_material_issues()가
+    UNKNOWN_MATERIAL/INVALID_DECIMAL로 이미 별도 검증한다) — 그런 행은
+    supply_type 분류와 무관하게 금액 집계에서만 조용히 제외한다.
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(다른 결합형 함수와
+    동일한 pre-seeding 정책).
+
+    Returns:
+        {contract_no: {
+            "gfm_amount": Decimal|None,
+            "government_issue_count": int,
+            "untagged_issue_count": int,
+            "calculable": bool,
+            "reason": str,
+        }}
+    """
+    zero = Decimal("0")
+
+    contract_nos = {
+        c.get("contract_no") for c in contracts if c.get("contract_no") is not None
+    }
+    contract_no_by_wo = {
+        w.get("wo_no"): w.get("contract_no")
+        for w in work_orders if w.get("wo_no") is not None
+    }
+
+    result: dict[str, dict] = {
+        contract_no: {
+            "gfm_amount": zero,
+            "government_issue_count": 0,
+            "untagged_issue_count": 0,
+            "calculable": True,
+            "reason": None,
+        }
+        for contract_no in contract_nos
+    }
+
+    for r in material_issues:
+        wo_no = r.get("wo_no")
+        if wo_no is None:
+            continue
+
+        contract_no = contract_no_by_wo.get(wo_no)
+        if contract_no is None or contract_no not in contract_nos:
+            continue
+
+        entry = result[contract_no]
+        supply_type = r.get("supply_type")
+
+        if supply_type is None:
+            entry["untagged_issue_count"] += 1
+            entry["calculable"] = False
+            continue
+
+        if supply_type != "GOVERNMENT":
+            continue
+
+        qty = _strict_decimal(r.get("issued_qty"))
+        unit_cost = _strict_decimal(r.get("unit_cost"))
+        if qty is None or unit_cost is None:
+            continue
+
+        line_amount = calculate_material_cost(qty, unit_cost)
+        if r.get("issue_type") == "RETURN":
+            line_amount = -line_amount
+
+        entry["gfm_amount"] += line_amount
+        entry["government_issue_count"] += 1
+
+    for entry in result.values():
+        if entry["calculable"]:
+            entry["gfm_amount"] = round_amount(entry["gfm_amount"])
+            entry["reason"] = "OK"
+        else:
+            entry["gfm_amount"] = None
+            entry["reason"] = (
+                f"material_issue {entry['untagged_issue_count']}건의 supply_type이 "
+                "분류되지 않아 관급재료비를 계산할 수 없습니다."
+            )
+
+    return result
