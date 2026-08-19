@@ -21,6 +21,8 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_contract_variance,
     calculate_actual_direct_expense_by_contract,
     calculate_ga_by_contract,
+    calculate_contract_total_cost,
+    calculate_budget_direct_expense_by_contract,
 )
 
 
@@ -1689,3 +1691,416 @@ def test_real_dataset_ga_not_calculable_without_rate_rule_file():
     assert ga_by_contract["CONTRACT-002"]["manufacturing_cost_budget"] == Decimal("3487872.00")
     assert ga_by_contract["CONTRACT-003"]["manufacturing_cost_actual"] == Decimal("0")
     assert ga_by_contract["CONTRACT-003"]["manufacturing_cost_budget"] == Decimal("1596162.00")
+
+
+# --- calculate_contract_total_cost (Phase 2 6단계, Actual만) ---
+
+def _tc_contract(contract_no="CONTRACT-A"):
+    return {"contract_no": contract_no}
+
+def _tc_manufacturing(contract_no="CONTRACT-A", amount="1000000.00"):
+    return {contract_no: {"actual_manufacturing_cost": Decimal(amount)}}
+
+def _tc_de(contract_no="CONTRACT-A", amount="500000.00"):
+    return {contract_no: {"direct_expense_amount": Decimal(amount)}}
+
+def _tc_ga_calculable(contract_no="CONTRACT-A", ga_actual="80000.00"):
+    return {contract_no: {"calculable": True, "ga_actual": Decimal(ga_actual), "reason": "OK"}}
+
+def _tc_ga_not_calculable(contract_no="CONTRACT-A",
+                           reason="[TEST FIXTURE] 적용 가능한 GA rate rule이 없습니다."):
+    return {contract_no: {"calculable": False, "ga_actual": None, "reason": reason}}
+
+def test_contract_total_cost_combines_manufacturing_and_direct_expense():
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "1000000.00"),
+        _tc_de("CONTRACT-A", "500000.00"),
+        _tc_ga_not_calculable("CONTRACT-A"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["manufacturing_cost"] == Decimal("1000000.00")
+    assert c["direct_expense"] == Decimal("500000.00")
+    assert c["total_cost_excl_ga"] == Decimal("1500000.00")
+
+def test_contract_total_cost_ga_calculable_adds_ga_to_total():
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "1000000.00"),
+        _tc_de("CONTRACT-A", "500000.00"),
+        _tc_ga_calculable("CONTRACT-A", "80000.00"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["ga_amount"] == Decimal("80000.00")
+    assert c["total_cost"] == Decimal("1580000.00")
+    assert c["reason"] == "OK"
+
+def test_contract_total_cost_ga_not_calculable_total_cost_is_none():
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "1000000.00"),
+        _tc_de("CONTRACT-A", "500000.00"),
+        _tc_ga_not_calculable("CONTRACT-A"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert c["total_cost"] is None
+    assert c["reason"] is not None
+    # GA가 계산 불가여도 total_cost_excl_ga는 정상적으로 채워져 있어야 한다.
+    assert c["total_cost_excl_ga"] == Decimal("1500000.00")
+
+def test_contract_total_cost_never_treats_missing_ga_as_zero():
+    # ga_amount가 None인지(0이 아닌지) 명시적으로 확인 — GA 부재를 0으로
+    # 대체하지 않는다는 정책의 핵심 검증.
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "1000000.00"),
+        _tc_de("CONTRACT-A", "500000.00"),
+        _tc_ga_not_calculable("CONTRACT-A"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["ga_amount"] is None
+    assert c["ga_amount"] != Decimal("0")
+
+def test_contract_total_cost_contract_with_no_direct_expense():
+    # DE 결과 dict에 이 계약이 아예 없으면 direct_expense=0으로 취급한다
+    # (DE 실적이 전혀 없는 계약과 동일 — 계산 불가가 아니라 실적 0).
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "1000000.00"),
+        {},
+        _tc_ga_calculable("CONTRACT-A", "80000.00"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["direct_expense"] == Decimal("0")
+    assert c["total_cost_excl_ga"] == Decimal("1000000.00")
+
+def test_contract_total_cost_seeds_contract_with_no_data_at_all():
+    result = calculate_contract_total_cost(
+        {}, {}, {}, [_tc_contract("CONTRACT-EMPTY")],
+    )
+    c = result["CONTRACT-EMPTY"]
+    assert c["manufacturing_cost"] == Decimal("0")
+    assert c["direct_expense"] == Decimal("0")
+    assert c["total_cost_excl_ga"] == Decimal("0")
+    assert c["calculable"] is False
+    assert c["total_cost"] is None
+    assert c["reason"] is not None
+
+def test_contract_total_cost_does_not_mutate_input_dicts():
+    manufacturing = _tc_manufacturing("CONTRACT-A", "1000000.00")
+    de = _tc_de("CONTRACT-A", "500000.00")
+    ga = _tc_ga_calculable("CONTRACT-A", "80000.00")
+    manufacturing_before = {k: dict(v) for k, v in manufacturing.items()}
+    de_before = {k: dict(v) for k, v in de.items()}
+    ga_before = {k: dict(v) for k, v in ga.items()}
+
+    calculate_contract_total_cost(manufacturing, de, ga, [_tc_contract("CONTRACT-A")])
+
+    assert manufacturing == manufacturing_before
+    assert de == de_before
+    assert ga == ga_before
+
+def test_contract_total_cost_independent_of_contract_variance():
+    actual_by_contract = {
+        "CONTRACT-A": {
+            "actual_material_cost": Decimal("100.00"), "actual_labor_cost": Decimal("50"),
+            "actual_overhead_cost": Decimal("10.00"), "actual_manufacturing_cost": Decimal("160.00"),
+            "work_orders": ["WO-1"],
+        }
+    }
+    budget_by_contract = {
+        "CONTRACT-A": {
+            "budget_material_cost": Decimal("80.00"), "budget_labor_cost": Decimal("60"),
+            "budget_overhead_cost": Decimal("15.00"), "budget_manufacturing_cost": Decimal("155.00"),
+            "work_orders": ["WO-1"], "unpriced_work_orders": [],
+        }
+    }
+    variance = calculate_contract_variance(
+        [_tc_contract("CONTRACT-A")], actual_by_contract, budget_by_contract,
+    )
+    total_cost = calculate_contract_total_cost(
+        actual_by_contract, _tc_de("CONTRACT-A", "40.00"),
+        _tc_ga_not_calculable("CONTRACT-A"), [_tc_contract("CONTRACT-A")],
+    )
+    assert variance["CONTRACT-A"]["total_variance"] == Decimal("5.00")
+    assert "total_cost_excl_ga" not in variance["CONTRACT-A"]
+    assert "total_variance" not in total_cost["CONTRACT-A"]
+    assert total_cost["CONTRACT-A"]["total_cost_excl_ga"] == Decimal("200.00")
+
+def test_contract_total_cost_decimal_precision():
+    result = calculate_contract_total_cost(
+        _tc_manufacturing("CONTRACT-A", "100.015"),
+        _tc_de("CONTRACT-A", "0.005"),
+        _tc_ga_calculable("CONTRACT-A", "0.01"),
+        [_tc_contract("CONTRACT-A")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["total_cost_excl_ga"] == Decimal("100.020")
+    assert c["total_cost"] == Decimal("100.030")
+
+
+# --- 실제 Phase 2 데이터 기준 Contract Total Cost 검증 ---
+
+def _load_real_contract_total_cost():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    products = rows("07_product_master.xlsx", "product")
+    contracts = rows("30_contract.xlsx", "contract")
+
+    actual_by_wo = calculate_actual_total_cost_by_wo(
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        products,
+    )
+    actual_by_contract = calculate_actual_total_cost_by_contract(work_orders, actual_by_wo)
+    budget_by_contract = calculate_standard_budget_by_contract(
+        contracts, work_orders, rows("12_standard_cost.xlsx", "standard_cost"), products,
+    )
+    de_by_contract = calculate_actual_direct_expense_by_contract(
+        contracts, work_orders, rows("31_direct_expense.xlsx", "direct_expense"),
+    )
+    rate_rules = rows("32_cost_rate_rule.xlsx", "cost_rate_rule")  # 저장소에 없음 -> []
+    ga_by_contract = calculate_ga_by_contract(
+        actual_by_contract, budget_by_contract, rate_rules, contracts,
+    )
+    return calculate_contract_total_cost(
+        actual_by_contract, de_by_contract, ga_by_contract, contracts,
+    )
+
+def test_real_dataset_contract_total_cost_excl_ga_matches_expected_values():
+    result = _load_real_contract_total_cost()
+    if result is None:
+        return
+
+    assert result["CONTRACT-001"]["total_cost_excl_ga"] == Decimal("2567220.88")
+    assert result["CONTRACT-002"]["total_cost_excl_ga"] == Decimal("2457612.00")
+    assert result["CONTRACT-003"]["total_cost_excl_ga"] == Decimal("0.00")
+
+def test_real_dataset_contract_total_cost_is_none_without_ga_rate():
+    # 32_cost_rate_rule.xlsx가 없으므로 3개 계약 모두 total_cost=None,
+    # calculable=False가 정상이다(0으로 대체되지 않는다).
+    result = _load_real_contract_total_cost()
+    if result is None:
+        return
+
+    for contract_no in ("CONTRACT-001", "CONTRACT-002", "CONTRACT-003"):
+        c = result[contract_no]
+        assert c["calculable"] is False
+        assert c["total_cost"] is None
+        assert c["ga_amount"] is None
+        assert c["reason"] is not None
+
+
+# --- calculate_budget_direct_expense_by_contract (Phase 2 7단계) ---
+#
+# 34_direct_expense_budget.xlsx는 저장소에 구조만 있고 실제 예산 행이 없다.
+# 아래 테스트의 budget_amount 값들은 전부 [TEST FIXTURE]이며 실제 예산이 아니다.
+
+def _bde_contract(contract_no="CONTRACT-A", start_date="2026-07-01"):
+    return {"contract_no": contract_no, "start_date": start_date}
+
+def _bde_row(contract_no="CONTRACT-A", budget_expense_id="BDE-1",
+             expense_type="외주가공비", budget_amount="100000",
+             effective_from=None, effective_to=None):
+    return {
+        "contract_no": contract_no, "budget_expense_id": budget_expense_id,
+        "expense_type": expense_type, "budget_amount": budget_amount,
+        "effective_from": effective_from, "effective_to": effective_to,
+        "description": "[TEST FIXTURE]",
+    }
+
+def test_budget_de_by_contract_sums_multiple_rows_for_same_contract():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [
+            _bde_row("CONTRACT-A", "BDE-1", budget_amount="100000"),
+            _bde_row("CONTRACT-A", "BDE-2", budget_amount="50000"),
+        ],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["budget_direct_expense"] == Decimal("150000.00")
+    assert c["reason"] == "OK"
+
+def test_budget_de_by_contract_no_data_is_not_calculable_not_zero():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")], [],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert c["budget_direct_expense"] is None
+    assert c["budget_direct_expense"] != Decimal("0")
+    assert c["reason"] is not None
+
+def test_budget_de_by_contract_seeds_all_contracts_from_master():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A"), _bde_contract("CONTRACT-EMPTY")],
+        [_bde_row("CONTRACT-A", budget_amount="100000")],
+    )
+    assert set(result.keys()) == {"CONTRACT-A", "CONTRACT-EMPTY"}
+    assert result["CONTRACT-EMPTY"]["calculable"] is False
+    assert result["CONTRACT-EMPTY"]["budget_direct_expense"] is None
+
+def test_budget_de_by_contract_excludes_row_with_unknown_contract_reference():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [_bde_row("CONTRACT-999", budget_amount="100000")],
+    )
+    assert set(result.keys()) == {"CONTRACT-A"}
+    assert result["CONTRACT-A"]["calculable"] is False
+
+def test_budget_de_by_contract_duplicate_budget_expense_id_still_both_summed():
+    # 중복 budget_expense_id라도 별도 검증 없이 각 행을 그대로 합산한다
+    # (이 함수는 단순 합산기이며, 중복 판정을 위한 새 오류 코드는 만들지 않는다).
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [
+            _bde_row("CONTRACT-A", "BDE-DUP", budget_amount="100000"),
+            _bde_row("CONTRACT-A", "BDE-DUP", budget_amount="20000"),
+        ],
+    )
+    assert result["CONTRACT-A"]["budget_direct_expense"] == Decimal("120000.00")
+
+def test_budget_de_by_contract_decimal_precision():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [
+            _bde_row("CONTRACT-A", "BDE-1", budget_amount="100.005"),
+            _bde_row("CONTRACT-A", "BDE-2", budget_amount="0.005"),
+        ],
+    )
+    # 100.005 + 0.005 = 100.010 -> ROUND_HALF_UP -> 100.01
+    assert result["CONTRACT-A"]["budget_direct_expense"] == Decimal("100.01")
+
+def test_budget_de_by_contract_negative_amount_is_summed_as_valid():
+    # 음수 예산(축소 등)도 유효한 값으로 그대로 합산한다 — 거부하거나 별도
+    # 취급하지 않는다(Actual DE의 환입 처리와 동일한 원칙).
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [
+            _bde_row("CONTRACT-A", "BDE-1", budget_amount="100000"),
+            _bde_row("CONTRACT-A", "BDE-2", budget_amount="-30000"),
+        ],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is True
+    assert c["budget_direct_expense"] == Decimal("70000.00")
+
+def test_budget_de_by_contract_effective_date_within_range_included():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A", start_date="2026-07-01")],
+        [_bde_row("CONTRACT-A", budget_amount="100000",
+                  effective_from="2026-01-01", effective_to="2026-12-31")],
+    )
+    assert result["CONTRACT-A"]["calculable"] is True
+
+def test_budget_de_by_contract_effective_date_outside_range_excluded():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A", start_date="2026-07-01")],
+        [_bde_row("CONTRACT-A", budget_amount="100000",
+                  effective_from="2025-01-01", effective_to="2025-12-31")],
+    )
+    c = result["CONTRACT-A"]
+    assert c["calculable"] is False
+    assert c["budget_direct_expense"] is None
+
+def test_budget_de_by_contract_multiple_expense_types_all_summed():
+    result = calculate_budget_direct_expense_by_contract(
+        [_bde_contract("CONTRACT-A")],
+        [
+            _bde_row("CONTRACT-A", "BDE-1", expense_type="외주가공비", budget_amount="100000"),
+            _bde_row("CONTRACT-A", "BDE-2", expense_type="특허권사용료", budget_amount="50000"),
+        ],
+    )
+    assert result["CONTRACT-A"]["budget_direct_expense"] == Decimal("150000.00")
+
+def test_budget_de_by_contract_independent_of_actual_direct_expense():
+    # Budget DE와 Actual DE는 서로 다른 함수/데이터라 한쪽 계산이 다른 쪽에
+    # 영향을 주지 않는다.
+    contracts = [_bde_contract("CONTRACT-A")]
+    budget_result = calculate_budget_direct_expense_by_contract(
+        contracts, [_bde_row("CONTRACT-A", budget_amount="100000")],
+    )
+    actual_result = calculate_actual_direct_expense_by_contract(
+        contracts,
+        [{"wo_no": "WO-1", "contract_no": "CONTRACT-A"}],
+        [{"expense_id": "DE-1", "wo_no": "WO-1", "contract_no": None, "amount": "500000"}],
+    )
+    assert budget_result["CONTRACT-A"]["budget_direct_expense"] == Decimal("100000.00")
+    assert actual_result["CONTRACT-A"]["direct_expense_amount"] == Decimal("500000.00")
+    assert "budget_direct_expense" not in actual_result["CONTRACT-A"]
+    assert "direct_expense_amount" not in budget_result["CONTRACT-A"]
+
+def test_budget_de_by_contract_does_not_mutate_inputs():
+    contracts = [_bde_contract("CONTRACT-A")]
+    rows_in = [_bde_row("CONTRACT-A", budget_amount="100000")]
+    contracts_before = [dict(c) for c in contracts]
+    rows_before = [dict(r) for r in rows_in]
+
+    calculate_budget_direct_expense_by_contract(contracts, rows_in)
+
+    assert contracts == contracts_before
+    assert rows_in == rows_before
+
+
+# --- 실제 Phase 2 데이터 기준 Budget DE 검증 ---
+
+def _load_real_budget_de():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "src")
+    from manufacturing_cost_engine.loader import load_dataset
+
+    dataset = Path("hanbit_mvp_dataset_phase1")
+    if not dataset.exists():
+        return None
+
+    data = load_dataset(dataset)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    contracts = rows("30_contract.xlsx", "contract")
+    budget_des = rows("34_direct_expense_budget.xlsx", "direct_expense_budget")
+    return calculate_budget_direct_expense_by_contract(contracts, budget_des), budget_des
+
+def test_real_dataset_budget_direct_expense_file_has_no_data_rows():
+    result = _load_real_budget_de()
+    if result is None:
+        return
+    _, budget_des = result
+    assert budget_des == []
+
+def test_real_dataset_budget_direct_expense_all_contracts_not_calculable():
+    # 34_direct_expense_budget.xlsx에 실제 행이 없으므로 3개 계약 모두
+    # calculable=False, budget_direct_expense=None이 정상이다(0 아님).
+    result = _load_real_budget_de()
+    if result is None:
+        return
+    budget_de_by_contract, _ = result
+
+    assert set(budget_de_by_contract.keys()) == {"CONTRACT-001", "CONTRACT-002", "CONTRACT-003"}
+    for contract_no in budget_de_by_contract:
+        c = budget_de_by_contract[contract_no]
+        assert c["calculable"] is False
+        assert c["budget_direct_expense"] is None
+        assert c["reason"] is not None

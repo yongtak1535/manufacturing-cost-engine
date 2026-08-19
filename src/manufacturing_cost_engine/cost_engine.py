@@ -1173,3 +1173,175 @@ def calculate_ga_by_contract(
         result[contract_no] = entry
 
     return result
+
+
+def calculate_contract_total_cost(
+    actual_manufacturing_by_contract,
+    direct_expense_by_contract,
+    ga_by_contract,
+    contracts,
+) -> dict[str, dict]:
+    """
+    Phase 2 6단계: contract_no -> {
+        "contract_no", "manufacturing_cost", "direct_expense",
+        "total_cost_excl_ga", "ga_amount", "total_cost", "calculable", "reason",
+    }.
+
+    이번 단계는 Actual Contract Total Cost만 다룬다(Budget Total Cost는
+    범위 밖 — Budget DE가 존재하지 않아 완전한 형태로 만들 수 없다는 사전조사
+    결론에 따라 이번 함수는 Budget을 전혀 참조하지 않는다).
+
+    calculate_actual_total_cost_by_contract(), calculate_actual_direct_expense_by_contract(),
+    calculate_ga_by_contract()가 이미 계산한 결과 dict 3개만 받아 더한다 —
+    세 함수 자체는 재계산하지도, 수정하지도 않는다.
+
+    manufacturing_cost = DM+DL+OH(Actual), direct_expense = DE(Actual).
+    total_cost_excl_ga = manufacturing_cost + direct_expense는 GA 상태와
+    무관하게 항상 계산된다.
+
+    GA가 calculable=True인 계약만 total_cost = total_cost_excl_ga + ga_amount로
+    채워진다. GA가 calculable=False(또는 그 계약이 ga_by_contract에 아예 없는
+    경우)면 ga_amount와 total_cost는 None으로 남고 calculable=False, reason에
+    사유가 명시된다 — GA 부재를 0으로 대체하지 않는다(calculate_ga_by_contract()가
+    이미 채택한 정책과 동일).
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(기존 함수들과 동일한
+    pre-seeding 정책) — manufacturing_cost/direct_expense가 없는 계약은 0으로
+    취급한다(둘 다 실적 기반 항목이라 "실적 없음=0"이 기존 정책과 일치한다).
+    """
+    zero = Decimal("0")
+
+    result: dict[str, dict] = {}
+    for c in contracts:
+        contract_no = c.get("contract_no")
+        if contract_no is None:
+            continue
+
+        manufacturing_cost = actual_manufacturing_by_contract.get(contract_no, {}).get(
+            "actual_manufacturing_cost", zero
+        )
+        direct_expense = direct_expense_by_contract.get(contract_no, {}).get(
+            "direct_expense_amount", zero
+        )
+        total_cost_excl_ga = manufacturing_cost + direct_expense
+
+        ga_entry = ga_by_contract.get(contract_no)
+        entry = {
+            "contract_no": contract_no,
+            "manufacturing_cost": manufacturing_cost,
+            "direct_expense": direct_expense,
+            "total_cost_excl_ga": total_cost_excl_ga,
+            "ga_amount": None,
+            "total_cost": None,
+            "calculable": False,
+            "reason": None,
+        }
+
+        if ga_entry is None:
+            entry["reason"] = "이 계약의 GA 계산 결과가 없습니다(calculate_ga_by_contract() 결과 부재)."
+        elif not ga_entry.get("calculable"):
+            entry["reason"] = ga_entry.get("reason") or "GA를 계산할 수 없어 total_cost를 산출할 수 없습니다."
+        else:
+            ga_amount = ga_entry.get("ga_actual")
+            entry["ga_amount"] = ga_amount
+            entry["total_cost"] = total_cost_excl_ga + ga_amount
+            entry["calculable"] = True
+            entry["reason"] = "OK"
+
+        result[contract_no] = entry
+
+    return result
+
+
+def calculate_budget_direct_expense_by_contract(
+    contracts,
+    budget_direct_expenses,
+) -> dict[str, dict]:
+    """
+    Phase 2 7단계: contract_no -> {
+        "contract_no", "budget_direct_expense", "calculable", "reason",
+    }.
+
+    34_direct_expense_budget.xlsx(Actual DE인 31_direct_expense.xlsx와는 완전히
+    분리된 별도 파일 — 실적과 예산을 같은 행에 결합하지 않는다)의 행을
+    contract_no 기준으로 합산한다. calculate_actual_direct_expense_by_contract()는
+    수정하지 않으며, 그 함수의 WO 귀속 롤업 로직도 여기서는 재현하지 않는다 —
+    Budget DE는 이번 단계에서 계약 단위 grain으로만 다룬다(WO 단위 예산이
+    필요하다는 근거를 데이터/문서에서 찾지 못했다).
+
+    각 행은 (contract_no, budget_expense_id, expense_type, budget_amount,
+    effective_from, effective_to, description) 구조를 가진다고 가정한다.
+    effective_from/effective_to가 있으면 해당 계약의 start_date가 그 범위
+    안에 있을 때만 합산 대상으로 본다(GA rate 선택 때 쓴 것과 동일한 기준일
+    관례 — contract.start_date). 범위가 없는 행(둘 다 None)은 항상 포함한다.
+    이 함수는 "여러 행을 하나만 골라야 하는" GA rate 선택과 달리 "해당되는
+    모든 행을 더하는" 단순 합산이라 priority/모호성 판정은 없다.
+
+    존재하지 않는 contract_no를 참조하는 행은 조용히 제외한다(다른 계산
+    함수들과 동일한 정책 — 새 오류를 만들지 않는다).
+
+    이 계약에 해당하는 Budget DE 행이 하나도 없으면 budget_direct_expense는
+    None, calculable=False로 남는다 — 0으로 채우지 않는다. 이번 데이터셋에는
+    34_direct_expense_budget.xlsx에 실제 행이 전혀 없으므로(구조만 준비),
+    실제 CLI에서는 3개 계약 모두 이 상태가 된다.
+
+    음수 budget_amount(예산 축소 등)는 유효한 값으로 그대로 합산한다 —
+    Actual DE의 환입(음수) 처리와 동일한 원칙이다.
+
+    contracts 마스터에 등록된 모든 계약을 결과에 포함한다(기존 함수들과
+    동일한 pre-seeding 정책).
+    """
+    contract_start_date = {
+        c.get("contract_no"): c.get("start_date")
+        for c in contracts if c.get("contract_no") is not None
+    }
+    contract_nos = set(contract_start_date)
+
+    def _in_effective_range(row, contract_no):
+        reference_date = contract_start_date.get(contract_no)
+        if reference_date is None:
+            return True
+        effective_from = row.get("effective_from")
+        effective_to = row.get("effective_to")
+        if effective_from is not None and str(reference_date) < str(effective_from):
+            return False
+        if effective_to is not None and str(reference_date) > str(effective_to):
+            return False
+        return True
+
+    sums: dict[str, Decimal] = {}
+    counts: dict[str, int] = {}
+
+    for row in budget_direct_expenses:
+        contract_no = row.get("contract_no")
+        if contract_no not in contract_nos:
+            continue
+
+        if not _in_effective_range(row, contract_no):
+            continue
+
+        amount = _strict_decimal(row.get("budget_amount"))
+        if amount is None:
+            continue
+
+        sums[contract_no] = sums.get(contract_no, Decimal("0")) + amount
+        counts[contract_no] = counts.get(contract_no, 0) + 1
+
+    result: dict[str, dict] = {}
+    for contract_no in contract_nos:
+        if counts.get(contract_no, 0) > 0:
+            result[contract_no] = {
+                "contract_no": contract_no,
+                "budget_direct_expense": round_amount(sums[contract_no]),
+                "calculable": True,
+                "reason": "OK",
+            }
+        else:
+            result[contract_no] = {
+                "contract_no": contract_no,
+                "budget_direct_expense": None,
+                "calculable": False,
+                "reason": "이 계약에 대한 Budget DE 데이터가 없습니다(34_direct_expense_budget.xlsx에 해당 행 없음).",
+            }
+
+    return result

@@ -20,6 +20,8 @@ from .cost_engine import (
     calculate_contract_variance,
     calculate_actual_direct_expense_by_contract,
     calculate_ga_by_contract,
+    calculate_contract_total_cost,
+    calculate_budget_direct_expense_by_contract,
 )
 
 def main():
@@ -273,6 +275,29 @@ def main():
                   f"GA_budget={v['ga_budget']}, GA_variance={v['ga_variance']}")
         else:
             print(f"  {contract_no}: calculable=False, reason={v['reason']}")
+
+    total_cost_by_contract = calculate_contract_total_cost(
+        actual_cost_by_contract, de_by_contract, ga_by_contract, contracts,
+    )
+    print(f"Contract Total Cost (Actual) calculated for {len(total_cost_by_contract)} contract(s)")
+    for contract_no in sorted(total_cost_by_contract):
+        v = total_cost_by_contract[contract_no]
+        print(f"  {contract_no}: manufacturing_cost={v['manufacturing_cost']}, "
+              f"direct_expense={v['direct_expense']}, "
+              f"total_cost_excl_ga={v['total_cost_excl_ga']}, "
+              f"ga_amount={v['ga_amount']}, total_cost={v['total_cost']}, "
+              f"calculable={v['calculable']}")
+
+    # 34_direct_expense_budget.xlsx는 구조만 있고 실제 예산 데이터는 없다(하드코딩 없음).
+    budget_direct_expenses = rows("34_direct_expense_budget.xlsx", "direct_expense_budget")
+    budget_de_by_contract = calculate_budget_direct_expense_by_contract(
+        contracts, budget_direct_expenses,
+    )
+    print(f"Contract Budget Direct Expense calculated for {len(budget_de_by_contract)} contract(s)")
+    for contract_no in sorted(budget_de_by_contract):
+        v = budget_de_by_contract[contract_no]
+        print(f"  {contract_no}: calculable={v['calculable']}, "
+              f"budget_direct_expense={v['budget_direct_expense']}, reason={v['reason']}")
 
 if __name__ == "__main__":
     main()
