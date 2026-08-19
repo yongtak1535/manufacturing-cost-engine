@@ -3,8 +3,10 @@ from manufacturing_cost_engine.validation import (
     validate_bom_issues, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_labor, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version, validate_labor_hours, validate_duplicate_files
+    validate_bom_version, validate_labor_hours, validate_duplicate_files,
+    calculate_oh_under_over_applied,
 )
+from decimal import Decimal
 
 def test_period_key_consistency():
     rows = [{"period_key": "2026-07", "year": 2026, "month": 7, "_source_row": 2}]
@@ -1029,6 +1031,116 @@ def test_gl_recon_ignores_unmapped_gl_account():
         [_period()],
     )
     assert issues == []
+
+
+# --- calculate_oh_under_over_applied ---
+
+def test_oh_under_over_applied_under_applied_positive_diff():
+    # 실제 CC-200과 동일한 패턴: 실제발생액(GL)만 있고 배부액이 없어 Under-applied.
+    result = calculate_oh_under_over_applied(
+        [_gl_line(gl_account_code="53200", debit="80000", cost_center_code="CC-200")],
+        [_account_mapping(gl_account_code="53200", cost_element_code="OH")],
+        [_wo()],
+        [],
+        [_work_center("WC-30", "CC-200")],
+        [_oh_rate("2026-07", "CC-200", "18000")],
+        [_product()],
+    )
+    entry = result[("2026-07", "CC-200")]
+    assert entry["actual_oh"] == Decimal("80000")
+    assert entry["applied_oh"] == Decimal("0")
+    assert entry["difference"] == Decimal("80000.00")
+    assert entry["no_labor_data"] is True
+
+def test_oh_under_over_applied_over_applied_negative_diff():
+    # 실제 CC-100과 동일한 패턴: 배부액이 실제발생액을 초과 -> Over-applied(음수).
+    result = calculate_oh_under_over_applied(
+        [_gl_line(gl_account_code="53100", debit="90000", cost_center_code="CC-100")],
+        [_account_mapping(gl_account_code="53100", cost_element_code="OH")],
+        [_wo()],
+        [_labor_row(actual_hours="10", amount="240000")],
+        [_work_center("WC-20", "CC-100")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    entry = result[("2026-07", "CC-100")]
+    assert entry["actual_oh"] == Decimal("90000")
+    assert entry["applied_oh"] == Decimal("180000.00")
+    assert entry["difference"] == Decimal("-90000.00")
+    assert entry["no_labor_data"] is False
+
+def test_oh_under_over_applied_excludes_cc_without_overhead_rate():
+    # 실제 CC-300과 동일한 케이스: CC-100에 GL OH 실적이 있어도 overhead_rate
+    # 자체가 없으면 비교 대상이 아니므로 0으로 채우지 않고 결과에서 제외한다.
+    result = calculate_oh_under_over_applied(
+        [_gl_line(gl_account_code="53100", debit="90000", cost_center_code="CC-100")],
+        [_account_mapping(gl_account_code="53100", cost_element_code="OH")],
+        [_wo()],
+        [],
+        [_work_center("WC-20", "CC-100")],
+        [_oh_rate("2026-07", "CC-200", "18000")],  # CC-100에는 rate가 없음
+        [_product()],
+    )
+    assert ("2026-07", "CC-100") not in result
+
+def test_oh_under_over_applied_ignores_ambiguous_and_unmapped_gl_accounts():
+    # validate_account_mapping()이 이미 UNMAPPED_GL/MAPPING_AMBIGUOUS로 보고하는
+    # 라인은 여기서도 조용히 집계에서 제외한다(중복 집계 금지).
+    result = calculate_oh_under_over_applied(
+        [
+            _gl_line(gl_account_code="53500", debit="25000", cost_center_code=None),
+            _gl_line(gl_account_code="53900", debit="30000", cost_center_code="CC-100"),
+        ],
+        [
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="OH", priority=10),
+            _account_mapping(gl_account_code="53500", cost_center_code=None,
+                              cost_element_code="DM", priority=10),
+        ],
+        [_wo()],
+        [],
+        [_work_center("WC-20", "CC-100")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    entry = result[("2026-07", "CC-100")]
+    assert entry["actual_oh"] == Decimal("0")
+
+def test_oh_under_over_applied_ignores_non_oh_cost_elements():
+    # DM/DL/GA로 매핑되는 계정은 OH 실제발생액 집계에 섞이지 않는다.
+    result = calculate_oh_under_over_applied(
+        [
+            _gl_line(gl_account_code="51100", debit="120000", cost_center_code="CC-100"),
+            _gl_line(gl_account_code="52100", debit="180000", cost_center_code="CC-100"),
+        ],
+        [
+            _account_mapping(gl_account_code="51100", cost_element_code="DM"),
+            _account_mapping(gl_account_code="52100", cost_element_code="DL"),
+        ],
+        [_wo()],
+        [],
+        [_work_center("WC-20", "CC-100")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    entry = result[("2026-07", "CC-100")]
+    assert entry["actual_oh"] == Decimal("0")
+
+def test_oh_under_over_applied_decimal_precision():
+    result = calculate_oh_under_over_applied(
+        [_gl_line(gl_account_code="53100", debit="100000.005", cost_center_code="CC-100")],
+        [_account_mapping(gl_account_code="53100", cost_element_code="OH")],
+        [_wo()],
+        [_labor_row(actual_hours="1.5", amount="36000")],
+        [_work_center("WC-20", "CC-100")],
+        [_oh_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    entry = result[("2026-07", "CC-100")]
+    # applied = 1.5 x 18000 = 27000.00; diff = 100000.005 - 27000.00 = 73000.005
+    # -> ROUND_HALF_UP -> 73000.01
+    assert entry["applied_oh"] == Decimal("27000.00")
+    assert entry["difference"] == Decimal("73000.01")
 
 
 # --- P1: INVALID_LABOR_RATE (validate_labor) ---

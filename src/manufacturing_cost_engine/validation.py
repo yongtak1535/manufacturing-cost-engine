@@ -5,7 +5,10 @@ from datetime import date, datetime
 from typing import Iterable
 
 from .models import ValidationIssue
-from .cost_engine import calculate_actual_material_cost, calculate_actual_labor_cost
+from .cost_engine import (
+    calculate_actual_material_cost, calculate_actual_labor_cost,
+    calculate_applied_overhead_by_cost_center, round_amount,
+)
 
 def _issue(code, severity, file, sheet, row, message, entity=None):
     return ValidationIssue(code, severity, file, sheet, row, message, entity)
@@ -1216,3 +1219,88 @@ def validate_duplicate_files(duplicate_groups):
         ))
 
     return issues
+
+def calculate_oh_under_over_applied(
+    gl_transactions, account_mappings, work_orders, labor_transactions,
+    work_centers, overhead_rates, products,
+):
+    """
+    (period_key, cost_center_code) -> {"actual_oh", "applied_oh", "difference",
+    "no_labor_data"}.
+
+    phase1_dataset_design.md §4-3/§7-6: "실제발생액 vs 배부액 차이 = under/over
+    applied → 표시만, 배분하지 않음". ValidationIssue를 만들지 않는 표시 전용
+    계산이며(오류가 아님), 어떤 재배부도 하지 않는다.
+
+    difference = actual_oh - applied_oh (양수: Under-applied — 실제발생액이
+    배부액보다 커서 배부가 부족했음. 음수: Over-applied — 배부액이 실제발생액을
+    초과했음). 이 부호 관례는 설계문서가 수식으로 확정한 것이 아니라 통상적인
+    원가회계 관례를 따른 구현상의 선택이다.
+
+    overhead_rate가 아예 없는 cost_center(예: CC-300)는 Applied 자체가 존재할 수
+    없어 비교 대상이 아니므로 결과에서 제외한다(0 아님, OVERHEAD_NOT_ALLOCATED가
+    이미 별도로 다루는 영역).
+
+    no_labor_data=True는 해당 (period, cost_center)에 labor_transaction 원본
+    행이 하나도 없다는 뜻이다(direct_indirect/시간 유효성과 무관) — Applied가
+    0인 이유가 "배부율 부재"가 아니라 "노동 실적 자체가 없음"인 경우를 구분해
+    표시하기 위함이다(현재 데이터셋은 CC-200/CC-300에 labor_transaction 실적이
+    전혀 없어 이 플래그가 True로 나온다).
+
+    GL 쪽 실제발생액은 validate_account_mapping()과 동일한 매핑 해석 규칙
+    (_index_account_mappings/_resolve_gl_account_mapping)을 그대로 재사용하며,
+    debit>0 AND credit==0이고 cost_element_code=="OH"로 해석되는 라인만 그
+    라인 자신의 cost_center_code로 집계한다. UNMAPPED_GL/MAPPING_AMBIGUOUS는
+    validate_account_mapping()이 이미 보고하므로 여기서는 조용히 제외한다.
+    """
+    mapping_index = _index_account_mappings(account_mappings)
+
+    actual_oh_by_cc = {}
+    for r in gl_transactions:
+        debit = _to_decimal(r.get("debit"))
+        credit = _to_decimal(r.get("credit"))
+        if debit is None or debit <= 0:
+            continue
+        if credit is not None and credit != 0:
+            continue
+
+        mapping_row = _resolve_gl_account_mapping(r, mapping_index)
+        if mapping_row is None:
+            continue
+
+        if mapping_row.get("cost_element_code") != "OH":
+            continue
+
+        key = (r.get("period_key"), r.get("cost_center_code"))
+        actual_oh_by_cc[key] = actual_oh_by_cc.get(key, Decimal("0")) + debit
+
+    applied_oh_by_cc = calculate_applied_overhead_by_cost_center(
+        work_orders, labor_transactions, work_centers, overhead_rates, products,
+    )
+
+    work_center_to_cc = {
+        wc.get("work_center_code"): wc.get("cost_center_code")
+        for wc in work_centers if wc.get("work_center_code")
+    }
+    wo_period = {w.get("wo_no"): w.get("period_key") for w in work_orders}
+    has_labor_data = set()
+    for r in labor_transactions:
+        cost_center_code = work_center_to_cc.get(r.get("work_center_code"))
+        period_key = wo_period.get(r.get("wo_no"))
+        if cost_center_code is None or period_key is None:
+            continue
+        has_labor_data.add((period_key, cost_center_code))
+
+    result = {}
+    for rate_row in overhead_rates:
+        key = (rate_row.get("period_key"), rate_row.get("cost_center_code"))
+        actual_oh = actual_oh_by_cc.get(key, Decimal("0"))
+        applied_oh = applied_oh_by_cc.get(key, Decimal("0"))
+        result[key] = {
+            "actual_oh": actual_oh,
+            "applied_oh": applied_oh,
+            "difference": round_amount(actual_oh - applied_oh),
+            "no_labor_data": key not in has_labor_data,
+        }
+
+    return result

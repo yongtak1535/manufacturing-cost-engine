@@ -601,3 +601,63 @@ def calculate_material_price_quantity_variance_by_wo(
         }
 
     return result
+
+
+def calculate_applied_overhead_by_cost_center(
+    work_orders,
+    labor_transactions,
+    work_centers,
+    overhead_rates,
+    products,
+) -> dict[tuple, Decimal]:
+    """
+    (period_key, cost_center_code) -> Applied OH(Σ DIRECT actual_hours × rate_per_base).
+
+    calculate_actual_overhead_cost()와 완전히 동일한 유효성 필터(유효 WO, DIRECT만,
+    hours/rate 파싱 가능, hours<0/rate<=0 제외, work_center→cost_center 매핑,
+    overhead_rate 존재 여부)를 적용하되, wo_no 대신 (period_key, cost_center_code)
+    단위로 재집계한다 — OH Under/Over Applied는 WO 단위가 아니라 기간×CC 단위로만
+    비교 가능하기 때문이다(GL 실제발생액에 wo_no가 없어 WO별 분해 근거가 없음).
+    calculate_actual_overhead_cost() 자체는 수정하지 않는다.
+    """
+    valid_wo_nos = _valid_work_order_nos(work_orders, products)
+    wo_period = {w.get("wo_no"): w.get("period_key") for w in work_orders}
+    work_center_to_cc = {
+        wc.get("work_center_code"): wc.get("cost_center_code")
+        for wc in work_centers if wc.get("work_center_code")
+    }
+    rate_by_key = {
+        (r.get("period_key"), r.get("cost_center_code")): _strict_decimal(r.get("rate_per_base"))
+        for r in overhead_rates
+    }
+
+    applied_by_cc: dict[tuple, Decimal] = {}
+
+    for r in labor_transactions:
+        wo_no = r.get("wo_no")
+        if wo_no not in valid_wo_nos:
+            continue
+
+        if r.get("direct_indirect") != "DIRECT":
+            continue
+
+        hours = _strict_decimal(r.get("actual_hours"))
+        rate = _strict_decimal(r.get("actual_rate"))
+        if hours is None or rate is None or hours < 0 or rate <= 0:
+            continue
+
+        cost_center_code = work_center_to_cc.get(r.get("work_center_code"))
+        if cost_center_code is None:
+            continue
+
+        period_key = wo_period.get(wo_no)
+        key = (period_key, cost_center_code)
+        oh_rate = rate_by_key.get(key)
+        if oh_rate is None:
+            continue
+
+        applied_by_cc[key] = applied_by_cc.get(key, Decimal("0")) + calculate_overhead_cost(
+            hours, oh_rate
+        )
+
+    return applied_by_cc

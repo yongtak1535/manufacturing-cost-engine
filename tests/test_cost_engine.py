@@ -15,6 +15,7 @@ from manufacturing_cost_engine.cost_engine import (
     calculate_actual_unit_cost_by_wo,
     calculate_total_variance_by_wo,
     calculate_material_price_quantity_variance_by_wo,
+    calculate_applied_overhead_by_cost_center,
 )
 
 
@@ -608,3 +609,64 @@ def test_pv_qv_decimal_precision():
     # PV = 100.01 - (33.34 x 3 = 100.02) = -0.01
     assert mat["price_variance"] == Decimal("-0.01")
     assert mat["quantity_variance"] == Decimal("0.00")
+
+
+# --- calculate_applied_overhead_by_cost_center ---
+
+def test_applied_overhead_by_cost_center_sums_multiple_wo_into_one_cc():
+    result = calculate_applied_overhead_by_cost_center(
+        [_wo(wo_no="WO-1"), _wo(wo_no="WO-2")],
+        [
+            _labor(wo_no="WO-1", actual_hours="1", work_center_code="WC-20"),
+            _labor(wo_no="WO-2", actual_hours="2", work_center_code="WC-20"),
+        ],
+        [_work_center("WC-20", "CC-100")],
+        [_overhead_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    assert result == {("2026-07", "CC-100"): Decimal("54000.00")}
+
+def test_applied_overhead_by_cost_center_tracks_multiple_cc_independently():
+    result = calculate_applied_overhead_by_cost_center(
+        [_wo(wo_no="WO-1"), _wo(wo_no="WO-2")],
+        [
+            _labor(wo_no="WO-1", actual_hours="1", work_center_code="WC-20"),
+            _labor(wo_no="WO-2", actual_hours="2", work_center_code="WC-30"),
+        ],
+        [_work_center("WC-20", "CC-100"), _work_center("WC-30", "CC-200")],
+        [
+            _overhead_rate("2026-07", "CC-100", "18000"),
+            _overhead_rate("2026-07", "CC-200", "10000"),
+        ],
+        [_product()],
+    )
+    assert result == {
+        ("2026-07", "CC-100"): Decimal("18000.00"),
+        ("2026-07", "CC-200"): Decimal("20000.00"),
+    }
+
+def test_applied_overhead_by_cost_center_excludes_cc_without_rate():
+    # 실제 CC-300과 동일한 케이스: overhead_rate가 없으면 임의 배분하지 않고 제외한다.
+    result = calculate_applied_overhead_by_cost_center(
+        [_wo()],
+        [_labor(actual_hours="1", work_center_code="WC-50")],
+        [_work_center("WC-50", "CC-300")],
+        [_overhead_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    assert result == {}
+
+def test_applied_overhead_by_cost_center_excludes_invalid_labor_rows():
+    # calculate_actual_overhead_cost()와 동일한 필터: INDIRECT/음수 시간/rate<=0 제외.
+    result = calculate_applied_overhead_by_cost_center(
+        [_wo()],
+        [
+            _labor(direct_indirect="INDIRECT", actual_hours="1"),
+            _labor(actual_hours="-1"),
+            _labor(actual_rate="0"),
+        ],
+        [_work_center("WC-20", "CC-100")],
+        [_overhead_rate("2026-07", "CC-100", "18000")],
+        [_product()],
+    )
+    assert result == {}

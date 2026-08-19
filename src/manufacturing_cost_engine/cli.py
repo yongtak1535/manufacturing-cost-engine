@@ -9,7 +9,8 @@ from .validation import (
     validate_labor, validate_gl_balance, validate_routing, validate_account_mapping,
     validate_standard_cost, validate_actual_cost, validate_gl_reconciliation,
     validate_bom_issues, validate_gl_period, validate_tolerance_rules,
-    validate_bom_version, validate_labor_hours, validate_duplicate_files
+    validate_bom_version, validate_labor_hours, validate_duplicate_files,
+    calculate_oh_under_over_applied,
 )
 from .cost_engine import (
     calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
@@ -188,6 +189,21 @@ def main():
     for wo_no in sorted(pv_qv_by_wo):
         v = pv_qv_by_wo[wo_no]
         print(f"  {wo_no}: price_variance={v['price_variance_total']}, quantity_variance={v['quantity_variance_total']}")
+
+    oh_under_over_by_cc = calculate_oh_under_over_applied(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("05_account_mapping.xlsx", "account_mapping"),
+        work_orders,
+        labor_rows,
+        work_centers,
+        overhead_rates,
+        products,
+    )
+    print(f"OH Under/Over Applied calculated for {len(oh_under_over_by_cc)} (period, cost_center)")
+    for key in sorted(oh_under_over_by_cc, key=str):
+        v = oh_under_over_by_cc[key]
+        print(f"  {key}: actual_oh={v['actual_oh']}, applied_oh={v['applied_oh']}, "
+              f"difference={v['difference']}, no_labor_data={v['no_labor_data']}")
 
 if __name__ == "__main__":
     main()
