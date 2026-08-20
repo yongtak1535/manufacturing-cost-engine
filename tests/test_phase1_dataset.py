@@ -1,8 +1,22 @@
+from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 
 from manufacturing_cost_engine.loader import (
     excel_files,
     load_dataset,
+    duplicate_file_groups,
+)
+from manufacturing_cost_engine.validation import (
+    validate_duplicate_files, validate_period_rows, validate_work_orders,
+    validate_material_issues, validate_bom_issues, validate_bom_version,
+    validate_tolerance_rules, validate_routing, validate_labor,
+    validate_labor_hours, validate_gl_balance, validate_gl_period,
+    validate_account_mapping, validate_standard_cost, validate_actual_cost,
+    validate_gl_reconciliation, validate_contract, validate_direct_expense,
+)
+from manufacturing_cost_engine.cost_engine import (
+    calculate_actual_total_cost_by_wo, calculate_total_variance_by_wo,
 )
 
 
@@ -352,3 +366,321 @@ def test_contract_material_supply_type_no_real_government_or_company_values():
 
     assert len(rows) == 0
     assert all(r.get("supply_type") in (None,) for r in rows)
+
+
+# --- Phase 1 regression lock (files/phase1_validation_baseline.md, commit 2d6afc8) ---
+#
+# 아래 섹션은 Phase 1을 "고치는" 것이 아니라, 현재 실제 데이터셋에 대한
+# validation/원가계산 결과를 회귀 기준선으로 잠그는 것이다. cli.py의
+# main()과 정확히 동일한 순서로 검증 함수를 호출해 issues 리스트를
+# 재구성한다(cli.py의 조립 로직 자체는 별도 함수로 분리되어 있지 않아
+# 재사용할 수 없으므로, 여기서는 그 순서를 그대로 따라간다 — 새 검증
+# 함수를 만들지 않는다).
+
+def _build_phase1_issues(data):
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    issues = []
+    issues += validate_duplicate_files(duplicate_file_groups(DATASET_DIR))
+    issues += validate_period_rows(rows("02_period.xlsx", "period"))
+
+    products = rows("07_product_master.xlsx", "product")
+    issues += validate_work_orders(rows("20_work_order.xlsx", "work_order"), products)
+
+    contracts = rows("30_contract.xlsx", "contract")
+    issues += validate_contract(contracts, rows("20_work_order.xlsx", "work_order"))
+
+    direct_expenses = rows("31_direct_expense.xlsx", "direct_expense")
+    issues += validate_direct_expense(
+        direct_expenses, contracts, rows("20_work_order.xlsx", "work_order")
+    )
+
+    issues += validate_material_issues(
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("08_material_master.xlsx", "material"),
+        rows("20_work_order.xlsx", "work_order"),
+        rows("03_cost_center.xlsx", "cost_center"),
+    )
+
+    issues += validate_bom_issues(
+        rows("20_work_order.xlsx", "work_order"),
+        rows("10_bom.xlsx", "bom_item"),
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("08_material_master.xlsx", "material"),
+        rows("06_uom_conversion.xlsx", "uom_conversion"),
+    )
+
+    issues += validate_bom_version(rows("10_bom.xlsx", "bom_version"))
+    issues += validate_tolerance_rules(rows("14_tolerance_rule.xlsx", "tolerance_rule"))
+    issues += validate_routing(
+        rows("20_work_order.xlsx", "work_order"),
+        rows("11_routing.xlsx", "routing_version"),
+        rows("11_routing.xlsx", "routing_operation"),
+        rows("09_work_center.xlsx", "work_center"),
+    )
+
+    wo_map = {r.get("wo_no"): r for r in rows("20_work_order.xlsx", "work_order")}
+    routing_index = {}
+    for r in rows("11_routing.xlsx", "routing_operation"):
+        routing_index[(r.get("routing_version_id"), r.get("operation_seq"))] = r
+    routing_version_by_product = {}
+    for h in rows("11_routing.xlsx", "routing_version"):
+        product_code = h.get("product_code")
+        routing_version_id = h.get("routing_version_id")
+        if product_code is not None and routing_version_id is not None:
+            routing_version_by_product.setdefault(product_code, routing_version_id)
+
+    def resolve_routing_version_id(wo_row):
+        explicit = wo_row.get("routing_version_id")
+        if explicit is not None:
+            return explicit
+        return routing_version_by_product.get(wo_row.get("product_code"))
+
+    labor_rows = rows("23_labor_transaction.xlsx", "labor_transaction")
+    labor_index = {}
+    for r in labor_rows:
+        wo = r.get("wo_no")
+        wo_row = wo_map.get(wo)
+        if not wo_row:
+            continue
+        routing_version_id = resolve_routing_version_id(wo_row)
+        if routing_version_id is None:
+            continue
+        routing_row = routing_index.get((routing_version_id, r.get("operation_seq")))
+        if routing_row is not None:
+            labor_index[(wo, r.get("operation_seq"))] = routing_row
+    issues += validate_labor(labor_rows, labor_index)
+    issues += validate_labor_hours(
+        rows("20_work_order.xlsx", "work_order"),
+        labor_rows,
+        rows("21_production_output.xlsx", "production_output"),
+        rows("11_routing.xlsx", "routing_operation"),
+        rows("11_routing.xlsx", "routing_version"),
+    )
+    issues += validate_gl_balance(rows("24_gl_transaction.xlsx", "gl_transaction"))
+    issues += validate_gl_period(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("02_period.xlsx", "period"),
+    )
+    issues += validate_account_mapping(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("05_account_mapping.xlsx", "account_mapping"),
+    )
+    issues += validate_standard_cost(
+        rows("12_standard_cost.xlsx", "standard_cost"),
+        rows("12_standard_cost.xlsx", "standard_cost_detail"),
+        products,
+        rows("04_cost_element.xlsx", "cost_element"),
+        rows("08_material_master.xlsx", "material"),
+    )
+
+    work_orders = rows("20_work_order.xlsx", "work_order")
+    production_outputs = rows("21_production_output.xlsx", "production_output")
+    work_centers = rows("09_work_center.xlsx", "work_center")
+    overhead_rates = rows("13_overhead_rate.xlsx", "overhead_rate")
+
+    issues += validate_actual_cost(
+        work_orders, production_outputs, labor_rows, work_centers, overhead_rates,
+    )
+    issues += validate_gl_reconciliation(
+        rows("24_gl_transaction.xlsx", "gl_transaction"),
+        rows("05_account_mapping.xlsx", "account_mapping"),
+        work_orders,
+        rows("22_material_issue.xlsx", "material_issue"),
+        labor_rows,
+        rows("08_material_master.xlsx", "material"),
+        products,
+        rows("02_period.xlsx", "period"),
+    )
+    return issues
+
+
+def _load_expected_results_rows():
+    # 90_expected_results.xlsx는 검증 픽스처라 load_dataset()의 로딩 대상에서
+    # 제외되므로(test_excel_files_exclude_expected_result_files 참고) openpyxl로
+    # 직접 읽는다.
+    import openpyxl
+    wb = openpyxl.load_workbook(DATASET_DIR / "90_expected_results.xlsx", read_only=True)
+    ws = wb["validation_summary"]
+    rows = list(ws.iter_rows(values_only=True))
+    return rows[1:]  # (assertion_id, expected_status, expected_value, note)
+
+
+# 현재 데이터셋 전체에서 실제로 발생하는 validation code별 건수(총 64건, 30개
+# 코드). files/phase1_validation_baseline.md §2에 기록된 상태와 동일하다.
+EXPECTED_ISSUE_CODE_COUNTS = {
+    "UOM_CONVERSION_MISSING": 14,
+    "MISSING_MATERIAL_ISSUE": 13,
+    "OPERATION_CODE_MISMATCH": 6,
+    "NOT_IN_BOM": 3,
+    "GL_RECON_DIFFERENCE": 2,
+    "EXCLUDED_WO": 2,
+    "DUPLICATE_FILE": 1,
+    "UNKNOWN_PRODUCT": 1,
+    "INVALID_DECIMAL": 1,
+    "UNKNOWN_MATERIAL": 1,
+    "UNKNOWN_WO": 1,
+    "NEGATIVE_QUANTITY": 1,
+    "BOM_OVER_ISSUE": 1,
+    "TOLERANCE_AMBIGUOUS": 1,
+    "UNKNOWN_ROUTING": 1,
+    "UNKNOWN_ROUTING_OPERATION": 1,
+    "INVALID_LABOR_RATE": 1,
+    "NEGATIVE_OVERTIME": 1,
+    "HOURS_SUM_MISMATCH": 1,
+    "EXCESSIVE_LABOR_HOURS": 1,
+    "GL_UNBALANCED_DOCUMENT": 1,
+    "PERIOD_MISMATCH": 1,
+    "PERIOD_CLOSED": 1,
+    "UNMAPPED_GL": 1,
+    "MAPPING_AMBIGUOUS": 1,
+    "STD_DETAIL_SUM_MISMATCH": 1,
+    "STANDARD_COST_MISSING": 1,
+    "REWORK_REVIEW_REQUIRED": 1,
+    "ZERO_DENOMINATOR": 1,
+    "NO_PRODUCTION_OUTPUT": 1,
+}
+
+# These seven assertions are known unresolved Phase 1 dataset/fixture
+# discrepancies documented in files/phase1_validation_baseline.md. They are
+# intentionally not normalized or repaired by the regression test. This dict
+# is the single source of truth for their currently-observed actual values —
+# it is not a claim that these values are correct, only that they are the
+# current, unchanged baseline.
+KNOWN_UNRESOLVED_ACTUAL_VALUES = {
+    "E-002": 0,
+    "E-003": 3,
+    "E-011": 0,
+    "E-016": 14,
+    "E-018": 13,
+    "E-024": 0,
+    "E-027": 2,
+}
+
+
+def test_phase1_validation_issue_counts_are_stable():
+    # 실제 Phase 1 데이터셋 전체에 대한 validation issue 총건수/코드별 건수가
+    # files/phase1_validation_baseline.md에 기록된 상태에서 벗어나지 않는지
+    # 잠근다. 코드 분류(예: BOM 4분류) 자체는 synthetic 테스트가 검증하지만,
+    # "실제 20개 WO/62개 material_issue 등에 대해 정확히 몇 건이 나오는가"는
+    # 지금까지 어떤 pytest도 보호하지 않았다.
+    data = load_dataset(DATASET_DIR)
+    issues = _build_phase1_issues(data)
+
+    assert len(issues) == 64
+    assert Counter(i.code for i in issues) == Counter(EXPECTED_ISSUE_CODE_COUNTS)
+
+
+def test_phase1_expected_results_baseline_is_stable():
+    # 90_expected_results.xlsx의 32개 assertion 중 25개는 실제 결과와
+    # 일치하고, 7개(KNOWN_UNRESOLVED_ACTUAL_VALUES)는 근거 부족/설계 문서
+    # 충돌/fixture 결함으로 아직 해결되지 않은 상태다
+    # (files/phase1_validation_baseline.md §3~4 참고). 이 테스트는 그
+    # 25/7 구성이 그대로 유지되는지 잠글 뿐, 7개를 32/32로 맞추지 않는다.
+    assert set(KNOWN_UNRESOLVED_ACTUAL_VALUES) == {
+        "E-002", "E-003", "E-011", "E-016", "E-018", "E-024", "E-027",
+    }
+
+    data = load_dataset(DATASET_DIR)
+    issues = _build_phase1_issues(data)
+    actual_counts = Counter(i.code for i in issues)
+
+    expected_rows = _load_expected_results_rows()
+    assert len(expected_rows) == 32
+
+    match_count = 0
+    unresolved_seen = set()
+    for assertion_id, expected_status, expected_value, _note in expected_rows:
+        actual_value = actual_counts.get(expected_status, 0)
+        if assertion_id in KNOWN_UNRESOLVED_ACTUAL_VALUES:
+            unresolved_seen.add(assertion_id)
+            assert actual_value == KNOWN_UNRESOLVED_ACTUAL_VALUES[assertion_id], (
+                f"{assertion_id}({expected_status}): known-unresolved actual "
+                f"value changed — investigate before updating this baseline"
+            )
+        else:
+            assert actual_value == int(expected_value), (
+                f"{assertion_id}({expected_status}): previously-matching "
+                f"assertion regressed"
+            )
+            match_count += 1
+
+    assert unresolved_seen == set(KNOWN_UNRESOLVED_ACTUAL_VALUES)
+    assert match_count == 25
+    assert len(unresolved_seen) == 7
+
+
+def test_phase1_total_actual_cost_is_stable():
+    # 전체 20개 WO에 대한 실적 원가 합계(CLI의 "Total Actual Cost (all WOs)")를
+    # 잠근다. Contract 단위 합계(test_real_dataset_contract_00*)는 이미
+    # test_cost_engine.py에 있으므로 중복 작성하지 않는다 — 여기서는 그
+    # 테스트들이 다루지 않는 "전체 WO 합계" 하나만 본다.
+    data = load_dataset(DATASET_DIR)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    actual_cost_by_wo = calculate_actual_total_cost_by_wo(
+        rows("20_work_order.xlsx", "work_order"),
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        rows("07_product_master.xlsx", "product"),
+    )
+    total_actual_cost = sum(
+        (v["total_cost"] for v in actual_cost_by_wo.values()), start=Decimal("0")
+    )
+
+    assert total_actual_cost == Decimal("4921044.89")
+
+
+def test_phase1_wo_total_variance_is_stable():
+    # 실제 데이터셋의 WO별 total_variance(CLI "Total Variance calculated for
+    # 17 work order(s)")를 하나의 매핑으로 잠근다. WO-2607-009/017/020은
+    # 표준원가/생산실적 부재로 계산 불가라 이 결과에 아예 나타나지 않는다
+    # (이 자체도 baseline의 일부이므로 dict 비교로 함께 고정된다).
+    data = load_dataset(DATASET_DIR)
+
+    def rows(file, sheet):
+        return data.get(f"{file}::{sheet}", [])
+
+    variance_by_wo = calculate_total_variance_by_wo(
+        rows("20_work_order.xlsx", "work_order"),
+        rows("22_material_issue.xlsx", "material_issue"),
+        rows("23_labor_transaction.xlsx", "labor_transaction"),
+        rows("08_material_master.xlsx", "material"),
+        rows("09_work_center.xlsx", "work_center"),
+        rows("13_overhead_rate.xlsx", "overhead_rate"),
+        rows("07_product_master.xlsx", "product"),
+        rows("21_production_output.xlsx", "production_output"),
+        rows("12_standard_cost.xlsx", "standard_cost"),
+    )
+
+    expected_total_variance = {
+        "WO-2607-001": Decimal("318002.00"),
+        "WO-2607-002": Decimal("-795256.00"),
+        "WO-2607-003": Decimal("-1077685.12"),
+        "WO-2607-004": Decimal("-457780.00"),
+        "WO-2607-005": Decimal("-557520.00"),
+        "WO-2607-006": Decimal("-795256.00"),
+        "WO-2607-007": Decimal("-1078012.80"),
+        "WO-2607-008": Decimal("-212872.38"),
+        "WO-2607-010": Decimal("-657440.00"),
+        "WO-2607-011": Decimal("-1078012.80"),
+        "WO-2607-012": Decimal("-562440.00"),
+        "WO-2607-013": Decimal("-557520.00"),
+        "WO-2607-014": Decimal("-942261.20"),
+        "WO-2607-015": Decimal("-364796.81"),
+        "WO-2607-016": Decimal("-556040.00"),
+        "WO-2607-018": Decimal("-433538.00"),
+        "WO-2607-019": Decimal("-1162624.00"),
+    }
+
+    assert len(variance_by_wo) == 17
+    actual_total_variance = {
+        wo_no: v["total_variance"] for wo_no, v in variance_by_wo.items()
+    }
+    assert actual_total_variance == expected_total_variance
