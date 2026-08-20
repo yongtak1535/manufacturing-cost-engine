@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from collections import Counter
 from decimal import Decimal
 from pathlib import Path
@@ -684,3 +686,63 @@ def test_phase1_wo_total_variance_is_stable():
         wo_no: v["total_variance"] for wo_no, v in variance_by_wo.items()
     }
     assert actual_total_variance == expected_total_variance
+
+
+# --- Phase 1 CLI entry-point regression lock ---
+#
+# cli.py의 main()은 반환값이 없는 순수 print() 부수효과 함수이며, 어떤
+# 기존 테스트도 main()이나 실제 CLI 프로세스를 호출하지 않는다. B~G에
+# 해당하는 값(총건수/코드별 건수/Total Actual Cost/Contract Actual DM·DL·OH/
+# GA·Budget DE의 calculable=False)은 이미 다른 테스트가 그 계산 함수를
+# 직접 호출해 보호하고 있다(test_phase1_validation_issue_counts_are_stable,
+# test_phase1_total_actual_cost_is_stable, test_real_dataset_contract_00*,
+# test_real_dataset_ga_not_calculable_without_rate_rule_file,
+# test_real_dataset_budget_direct_expense_all_contracts_not_calculable 등).
+# 여기서 새로 보호하는 것은 그 값들과는 다른 것 — "실제 CLI 진입점을 그대로
+# 실행했을 때 exit code가 0이고, cli.py 자신의 조립/출력 코드가 그 값들을
+# 실제로 정확히 출력하는가"이다. 반환 구조가 없어 subprocess로 실제
+# 프로세스를 실행하는 것이 유일한 방법이다. 전체 출력을 통째로 고정하지
+# 않고, 이미 다른 테스트로 보호되는 값들과 겹치는 핵심 라인만 존재 여부를
+# 확인한다.
+
+def test_phase1_cli_baseline_is_stable():
+    import os
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "manufacturing_cost_engine.cli",
+         str(DATASET_DIR.resolve())],
+        capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+
+    assert result.returncode == 0
+
+    output_lines = set(result.stdout.splitlines())
+    expected_lines = {
+        "Validation issues: 64",
+        "  HOURS_SUM_MISMATCH: 1",
+        "  PERIOD_MISMATCH: 1",
+        "  PERIOD_CLOSED: 1",
+        "  Total Actual Cost (all WOs): 4921044.89",
+        "Contract Actual Cost calculated for 3 contract(s)",
+        "  CONTRACT-001: work_orders=3, DM=704220.88, DL=636000, "
+        "OH=477000.00, Total=1817220.88",
+        "  CONTRACT-002: work_orders=4, DM=1089612.00, DL=96000, "
+        "OH=72000.00, Total=1257612.00",
+        "  CONTRACT-003: work_orders=2, DM=0, DL=0, OH=0, Total=0",
+        "Contract GA calculated for 3 contract(s)",
+        "Contract Budget Direct Expense calculated for 3 contract(s)",
+    }
+    missing = expected_lines - output_lines
+    assert not missing, f"CLI output missing expected lines: {missing}"
+
+    # GA/Budget DE는 3개 계약 전부 calculable=False다(rate rule/budget 데이터
+    # 부재, 이미 알려진 상태 — E-002 등 unresolved와 무관). 정확한 사유
+    # 문구(한글)는 다른 테스트가 이미 다루지 않으므로 여기서는 개수만 본다.
+    ga_section = result.stdout.split("Contract GA calculated")[1].split(
+        "Contract Total Cost"
+    )[0]
+    budget_de_section = result.stdout.split(
+        "Contract Budget Direct Expense calculated"
+    )[1]
+    assert ga_section.count("calculable=False") == 3
+    assert budget_de_section.count("calculable=False") == 3
