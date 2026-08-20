@@ -3444,6 +3444,48 @@ def test_regulatory_ga_gfm_zero_vs_missing_distinction_preserved_with_new_dm_inp
     assert result_missing_gfm["CONTRACT-A"]["calculable"] is False
     assert result_missing_gfm["CONTRACT-A"]["ga_base_amount_actual"] is None
 
+def test_regulatory_ga_include_gfm_budget_side_double_counts_when_gfm_not_separable():
+    # [알려진 위험을 재현·고정하는 테스트 — 현재 동작을 "정상 계산"으로
+    # 승인하는 것이 아니다]
+    #
+    # Actual 쪽은 dm_excluding_gfm_by_contract가 실제로 관급재료비를 제외한
+    # 값이라서 INCLUDE_GFM basis에서 gfm을 한 번 더하는 것이 올바르게
+    # 성립한다(§test_regulatory_ga_include_gfm_adds_gfm_exactly_once_
+    # no_double_counting). 하지만 Budget 쪽 budget_manufacturing_cost는
+    # 12_standard_cost.xlsx에 supply_type 개념이 없어 관급/사급이 전혀
+    # 분리되지 않은 값이다 — 즉 그 안에 관급재료비가 이미 포함되어 있을
+    # 가능성을 배제할 수 없다. 그런데 calculate_regulatory_ga_by_contract()는
+    # ga_base_amount_budget을 계산할 때도 basis와 무관하게 동일한
+    # calculate_ga_base_amount() 경로를 타므로, INCLUDE_GFM이면 이미
+    # 관급분이 섞여 있을 수 있는 budget_manufacturing_cost 위에 gfm을 또
+    # 더한다.
+    #
+    # 이 테스트의 목적은 그 위험을 "여기서 실제로 재현되는지" 고정해 두는
+    # 것이다 — budget_manufacturing_cost > 0, gfm > 0, calculation_basis=
+    # INCLUDE_GFM인 지금 조건에서 결과는 (budget_manufacturing_cost +
+    # budget_direct_expense + gfm)이 그대로 나온다. Budget 쪽 재료비에서
+    # 관급분을 신뢰성 있게 분리할 데이터/로직(Budget GFM 분리, 여전히
+    # 미구현)이 확보되면 이 assert는 반드시 바뀌어야 한다 — 지금 이 값을
+    # "규정상 유효한 계산 결과"로 쓰면 안 된다는 경고로 이 테스트를 남겨
+    # 둔다.
+    result = calculate_regulatory_ga_by_contract(
+        {"CONTRACT-A": {}},
+        {"CONTRACT-A": {"budget_manufacturing_cost": Decimal("5000")}},
+        {"CONTRACT-A": {"direct_expense_amount": Decimal("0")}},
+        {"CONTRACT-A": {"calculable": True, "budget_direct_expense": Decimal("0")}},
+        {"CONTRACT-A": Decimal("500")},
+        [_reg_rate_rule(company_code="HB01", plant_code="PL01", fiscal_year="2026", rate_pct="8")],
+        [_reg_contract("CONTRACT-A", plant_code="PL01", fiscal_year="2026")],
+        "INCLUDE_GFM",
+        _REF_DATE,
+        _dm_excl_gfm("CONTRACT-A", "1000"),
+    )
+    c = result["CONTRACT-A"]
+    # budget_manufacturing_cost(5000, 관급 포함 여부 불명) + budget_de(0) +
+    # gfm(500) = 5500 — budget_manufacturing_cost가 이미 그 500을 포함하고
+    # 있다면 이 5500은 실제보다 500만큼 과대계산된 위험한 값이다.
+    assert c["ga_base_amount_budget"] == Decimal("5500")
+
 def test_legacy_calculate_ga_by_contract_result_unchanged_by_regulatory_function_changes():
     # calculate_ga_by_contract()(보호 함수)는 dm_excluding_gfm_by_contract
     # 파라미터 추가와 완전히 무관하다 — 이 회귀 테스트가 통과한다는 것은
@@ -3639,3 +3681,72 @@ def test_real_dataset_gfm_not_calculable_where_material_issues_exist():
     assert contract_003["calculable"] is True
     assert contract_003["gfm_amount"] == Decimal("0")
     assert contract_003["untagged_issue_count"] == 0
+
+
+# --- Phase 2 GA 규정 정합 구조: 코드 레벨 안전장치 회귀 테스트 ---
+#
+# 아래 2개 테스트는 실 데이터를 전혀 요구하지 않는 순수 코드 검증이다.
+# GA 규정 정합 함수들이 (1) 아직 CLI에 연결되지 않았다는 것과, (2)
+# reference_date를 계약의 특정 날짜 필드에서 스스로 만들어내지 않는다는
+# 것은 지금까지 docstring 설명과 사람의 리뷰에만 의존해 왔다 — 이 두
+# 테스트는 그 두 가지를 회귀로 고정한다.
+
+def test_cli_does_not_import_or_call_regulatory_ga_functions():
+    # calculate_regulatory_ga_by_contract 등 GA 규정 정합 함수는 아직
+    # 준비 단계 코드이며 CLI에 연결하지 않기로 결정되어 있다(README.md에도
+    # "아직 CLI에는 연결되지 않은 준비 단계 코드"로 명시됨). 누군가 실수로
+    # cli.py에 import나 호출을 추가하면 이 테스트가 즉시 실패한다.
+    #
+    # 기존 legacy 함수(calculate_ga_by_contract, calculate_contract_total_cost
+    # 등)가 cli.py에 연결되어 있는 것은 그대로 유지되어야 하며, 이 테스트는
+    # 그 연결을 검사 대상으로 삼지 않는다 — 아래 5개 규정 정합 함수만
+    # 검사한다.
+    import inspect
+    from manufacturing_cost_engine import cli
+
+    source = inspect.getsource(cli)
+
+    for name in (
+        "calculate_regulatory_ga_by_contract",
+        "resolve_ga_actual_rate",
+        "resolve_ga_ceiling_rate",
+        "calculate_government_furnished_material_by_contract",
+        "calculate_actual_material_cost_excluding_gfm_by_contract",
+    ):
+        assert name not in source
+
+
+def test_regulatory_ga_functions_do_not_read_start_end_or_agreement_date_fields():
+    # resolve_ga_actual_rate/resolve_ga_ceiling_rate/
+    # calculate_regulatory_ga_by_contract의 실행 코드가 contract.start_date/
+    # end_date/contract_agreement_date를 reference_date 대신 읽지 않는다는
+    # 것을 고정한다. 이 세 필드를 쓰지 않기로 한 결정은 조사로 이미 확인됐다
+    # (방산원가규칙 제28조·시행세칙 제32조가 구분하는 4가지 법정 기준일 중
+    # 어느 것도 이 필드명과 문언상 일치하지 않고, 30_contract.xlsx의
+    # start_date/end_date가 실제로 무엇을 의미하는지도 미확인이다) — 하지만
+    # 지금까지 이를 잠그는 회귀 테스트는 없었다.
+    #
+    # 세 함수의 docstring 프로즈 안에는 이 필드들을 실제 코드 문법처럼
+    # 인용부호로 감싸 설명하는 문장이 존재한다(예: "...contract.get(
+    # \"start_date\") 등을 내부에서 임의로 쓰지 않음..." — 이 문장 자체가
+    # "쓰지 않는다"는 서술이라 docstring을 그대로 검사하면 오탐한다). 그래서
+    # fn.__doc__로 docstring 문자열을 소스에서 먼저 제거한 뒤, 남은 실행
+    # 코드에만 `"start_date"`처럼 인용부호를 포함한 딕셔너리 키 접근 패턴이
+    # 있는지 확인한다 — docstring 안의 백틱(`contract.start_date`) 표기나
+    # 일반 서술은 이 패턴과 겹치지 않는다
+    # (test_contract_type_is_product_structure_axis_not_legal_pricing_method()
+    # 에서 이미 검증해 쓰고 있는 것과 동일한 기법).
+    import inspect
+    from manufacturing_cost_engine import cost_engine as ce
+
+    forbidden_fields = ("start_date", "end_date", "contract_agreement_date")
+
+    for fn in (
+        ce.resolve_ga_actual_rate,
+        ce.resolve_ga_ceiling_rate,
+        ce.calculate_regulatory_ga_by_contract,
+    ):
+        source = inspect.getsource(fn)
+        code_only = source.replace(fn.__doc__, "", 1) if fn.__doc__ else source
+        for field in forbidden_fields:
+            assert f'"{field}"' not in code_only

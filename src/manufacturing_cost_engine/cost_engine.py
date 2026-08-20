@@ -1607,6 +1607,33 @@ def calculate_regulatory_ga_by_contract(
          쪽 DM이 이제 실제로 관급재료비를 제외한 값이므로, INCLUDE_GFM
          basis에서 이 값을 다시 더하는 것이 처음으로 이중집계 없이
          올바르게 성립한다.
+
+         [Budget 쪽 INCLUDE_GFM 이중집계 위험 — 명시적 경고, 아직 해결하지
+         않음] 위 "이중집계 없음"은 Actual 쪽에만 성립한다. calculate_
+         ga_base_amount()는 basis="INCLUDE_GFM"이면 무조건 government_
+         furnished_material을 한 번 더한다 — 이는 이 함수를 어떤
+         manufacturing_cost 값에 적용하든 동일하게 일어나는 무조건 동작이다.
+         Budget 쪽 mfg_excl_gfm_budget(=budget_manufacturing_cost +
+         budget_direct_expense)의 budget_manufacturing_cost는 §2에서 밝힌
+         대로 12_standard_cost.xlsx에 supply_type 개념이 전혀 없어 관급/
+         사급이 분리되지 않은 값이다 — 즉 그 안에 관급재료비가 이미
+         포함되어 있을 가능성을 배제할 수 없다. 그런 상태에서 INCLUDE_GFM
+         basis로 호출하면 ga_base_amount_budget이 government_furnished_
+         material을 실질적으로 두 번 반영(이미 섞여 있는 budget_
+         manufacturing_cost 값 + 별도로 더해진 gfm)하는 이중집계가 될
+         위험이 있다. 이 위험은 코드로 아직 막지 않았다 — Budget 쪽
+         재료비에서 관급분을 신뢰성 있게 분리할 데이터/로직이 아직 없기
+         때문이다(Budget GFM 분리는 여전히 미구현). 따라서 현재
+         ga_base_amount_budget/ga_budget이 INCLUDE_GFM basis로 계산해
+         낸 값은 규정상 유효한 계산 결과로 간주하지 않는다 — Budget GFM
+         원천 데이터(예: standard_cost_detail의 신뢰 가능한 supply_type
+         분리, 또는 contract_material_supply_type.xlsx 같은 별도 grain의
+         실제 값)가 확보되기 전까지 이 basis를 Budget 쪽 실제 계산에 쓰지
+         않는다. (재현 테스트:
+         test_regulatory_ga_include_gfm_budget_side_double_counts_when_
+         gfm_not_separable — 이 테스트는 현재 동작을 "정상"으로 승인하는
+         것이 아니라, Budget GFM이 실제로 분리되기 전까지 이 위험이 그대로
+         남아 있음을 고정해 두는 것이다.)
       4. rate 조회를 resolve_ga_actual_rate()(실적, company+plant+fiscal_year+
          reference_date)와 resolve_ga_ceiling_rate()(상한, industry_type+
          company_size+reference_date)로 완전히 분리한다. 두 축의 매칭 키는
