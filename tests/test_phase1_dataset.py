@@ -134,9 +134,16 @@ def test_phase1_dataset_contains_required_sheets():
 # --- Phase 2 8단계: GA 규정 정합 구조를 위한 최소 데이터 모델 추가 ---
 # 아래 신규 컬럼/파일은 스키마(구조)만 준비한 것이며, 실제 GA rate/GFM
 # 수치나 industry_type/company_size 등의 실제 분류값은 넣지 않았다 —
-# 기존 계약/자재불출 행의 신규 컬럼 값은 전부 비어 있어야 한다(None).
+# 기존 계약 행의 신규 컬럼 값은 전부 비어 있어야 한다(None). 예외는
+# plant_code 하나뿐이다 — 이 값은 "실제 GA 요율/GFM 데이터"가 아니라
+# 20_work_order.xlsx(20건 전부 plant_code=PL01) +
+# 01_company_plant.xlsx(회사 전체에 공장이 PL01 하나뿐)로 이미 확정되는
+# 구조적 사실이라서 별도 조사 라운드에서 채워 넣었다(아래
+# test_contract_plant_code_is_pl01_derived_from_work_order_and_plant_master
+# 참고). fiscal_year/industry_type/company_size/contract_agreement_date는
+# 여전히 채울 근거가 없어 비어 있다.
 
-def test_contract_has_ga_regulatory_columns_but_all_blank():
+def test_contract_has_ga_regulatory_columns_but_fiscal_year_industry_company_size_still_blank():
     data = load_dataset(DATASET_DIR)
     rows = data["30_contract.xlsx::contract"]
 
@@ -146,10 +153,34 @@ def test_contract_has_ga_regulatory_columns_but_all_blank():
         assert "fiscal_year" in r
         assert "industry_type" in r
         assert "company_size" in r
-        assert r["plant_code"] is None
         assert r["fiscal_year"] is None
         assert r["industry_type"] is None
         assert r["company_size"] is None
+
+
+def test_contract_plant_code_is_pl01_derived_from_work_order_and_plant_master():
+    # plant_code="PL01"은 임의로 채운 추정값이 아니라, 이 데이터셋 안에서
+    # 이미 확정되는 구조적 사실이다:
+    #   1) 20_work_order.xlsx의 20건 전부(계약 연결 여부와 무관하게) plant_code
+    #      가 "PL01" 하나뿐이다.
+    #   2) 01_company_plant.xlsx의 plant 시트에는 회사(HB01) 전체에 공장이
+    #      "PL01" 단 하나뿐이다 — 다른 값이 존재할 수 있는 여지 자체가 없다.
+    # 이 두 사실을 함께 확인해, 이번에 넣은 값이 "그럴듯한 추정"이 아니라
+    # 기존 마스터 데이터로부터 100% 확정 가능한 값이었음을 회귀로 고정한다.
+    data = load_dataset(DATASET_DIR)
+    contracts = data["30_contract.xlsx::contract"]
+    work_orders = data["20_work_order.xlsx::work_order"]
+    plants = data["01_company_plant.xlsx::plant"]
+
+    assert len(contracts) == 3
+    for r in contracts:
+        assert r["plant_code"] == "PL01"
+
+    assert len(work_orders) == 20
+    assert all(w["plant_code"] == "PL01" for w in work_orders)
+
+    assert len(plants) == 1
+    assert plants[0]["plant_code"] == "PL01"
 
 
 def test_contract_has_agreement_date_column_but_all_blank():
@@ -260,6 +291,58 @@ def test_contract_material_supply_type_key_columns_match_existing_master_naming(
     ws = wb.active
     headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
     assert headers == ["contract_no", "material_code", "supply_type"]
+
+
+# --- E-013/E-014/E-030 데이터 정정값 회귀 고정 ---
+# 아래 2개 테스트는 특정 셀 값을 "그냥 이 값이니까" 고정하는 것이 아니다.
+# phase1_dataset_build_spec.md가 명시한 조건(E-014: posting_date가 2026-06월,
+# E-030: 이 행은 "1행만 의도적 불일치" 규정 밖이라 산술이 맞아야 함)을 만족시키기
+# 위해 선택한 데이터 정정값이며, 그 조건이 다시 깨지지 않게 잠가 둔다.
+
+def test_gl_transaction_e014_row_posting_date_satisfies_closed_period_condition():
+    # build_spec.md:923 "posting_date가 2026-06인 행 1건(마감 기간, E-014)".
+    # GL-260731-021 line 2는 이 조건을 만족시키기 위해 posting_date를
+    # 2026-06-01로 정정했다(원본 저자가 실제로 쓴 값이라는 근거는 없음 —
+    # 2026-06월 조건을 만족하는 대체값). 이 행의 period_key는 처음부터
+    # "2026-06"으로 되어 있었으므로, posting_date만 그 기간과 일치시키면
+    # validate_gl_period()가 PERIOD_CLOSED를 정확히 1건 발생시킨다(E-014).
+    # posting_date가 다시 2026-07대로 되돌아가면 PERIOD_MISMATCH만 남고
+    # PERIOD_CLOSED는 사라지므로, 이 회귀는 그 되돌림을 잡아낸다.
+    data = load_dataset(DATASET_DIR)
+    rows = data["24_gl_transaction.xlsx::gl_transaction"]
+
+    target = [
+        r for r in rows
+        if r.get("document_no") == "GL-260731-021" and r.get("line_no") == 2
+    ]
+    assert len(target) == 1
+    row = target[0]
+
+    assert row["period_key"] == "2026-06"
+    assert row["posting_date"] == "2026-06-01"
+
+
+def test_labor_transaction_e030_sibling_row_hours_are_internally_consistent():
+    # phase1_dataset_build_spec.md:882 "actual_hours = regular_hours +
+    # overtime_hours — 1행만 의도적 불일치(E-030)". LB-2607-045는 그
+    # "1행"이 아니다(그 자리는 LB-2607-047) — 이 행은 E-028(NEGATIVE_OVERTIME,
+    # overtime_hours=-2)의 지정 행일 뿐이므로 산술은 맞아야 한다.
+    # actual_hours를 -1.5로 정정한 것은 "regular_hours(0.5) + overtime_hours(-2)
+    # = -1.5"를 맞추는 값이며, 원본 저자가 실제로 입력한 값이라는 근거는 없다
+    # (조건 충족값). 이 값이 다시 산술과 어긋나면(예: 이전 값 -1로 되돌아가면)
+    # validate_labor()가 이 행에 대해서도 HOURS_SUM_MISMATCH를 추가로
+    # 발생시켜 E-030이 1건이 아니라 2건이 되므로, 이 회귀는 그 상태를 잡아낸다.
+    data = load_dataset(DATASET_DIR)
+    rows = data["23_labor_transaction.xlsx::labor_transaction"]
+
+    target = [r for r in rows if r.get("labor_doc_no") == "LB-2607-045"]
+    assert len(target) == 1
+    row = target[0]
+
+    assert row["regular_hours"] == 0.5
+    assert row["overtime_hours"] == -2
+    assert row["actual_hours"] == -1.5
+    assert row["actual_hours"] == row["regular_hours"] + row["overtime_hours"]
 
 
 def test_contract_material_supply_type_no_real_government_or_company_values():

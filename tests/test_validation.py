@@ -131,8 +131,8 @@ def test_bom_issue_within_tolerance_no_issue():
     )
     assert issues == []
 
-def test_bom_issue_exceeds_tolerance_raises_error():
-    # expected = 20, tolerance = 0.4, diff = 1.5
+def test_bom_issue_exceeds_tolerance_raises_over_issue_error():
+    # expected = 20, tolerance = 0.4, diff = 1.5 (actual > expected) -> BOM_OVER_ISSUE
     issues = validate_bom_issues(
         [_wo(planned_qty="10")],
         [_bom_item(standard_qty="2", uom="EA")],
@@ -140,7 +140,7 @@ def test_bom_issue_exceeds_tolerance_raises_error():
         [_material()],
     )
     assert len(issues) == 1
-    assert issues[0].code == "BOM_ISSUE"
+    assert issues[0].code == "BOM_OVER_ISSUE"
     assert issues[0].severity == "ERROR"
     assert issues[0].related_entity == "MAT-001"
 
@@ -148,6 +148,7 @@ def test_bom_issue_mat003_uses_override_tolerance():
     # expected = 3.2, diff = 0.06.
     # default tolerance would be max(0.01, 3.2*0.02) = 0.064 -> would NOT flag
     # MAT-003 override tolerance = max(0.05, 3.2*0.01) = 0.05 -> DOES flag
+    # actual(3.26) > expected(3.2) -> BOM_OVER_ISSUE
     issues = validate_bom_issues(
         [_wo(bom_version_id="BOM-2", planned_qty="1")],
         [_bom_item(bom_version_id="BOM-2", material_code="MAT-003",
@@ -156,12 +157,12 @@ def test_bom_issue_mat003_uses_override_tolerance():
         [_material(material_code="MAT-003", base_uom="KG")],
     )
     assert len(issues) == 1
-    assert issues[0].code == "BOM_ISSUE"
+    assert issues[0].code == "BOM_OVER_ISSUE"
     assert issues[0].related_entity == "MAT-003"
 
 def test_bom_issue_sums_multiple_material_issue_lines():
     # two issue rows for the same wo+material must be summed: 11 + 11 = 22
-    # expected = 20, tolerance = 0.4, diff = 2 -> BOM_ISSUE
+    # expected = 20, tolerance = 0.4, diff = 2 (actual > expected) -> BOM_OVER_ISSUE
     issues = validate_bom_issues(
         [_wo(planned_qty="10")],
         [_bom_item(standard_qty="2", uom="EA")],
@@ -171,10 +172,46 @@ def test_bom_issue_sums_multiple_material_issue_lines():
         ],
         [_material()],
     )
-    bom_issues = [i for i in issues if i.code == "BOM_ISSUE"]
+    bom_issues = [i for i in issues if i.code == "BOM_OVER_ISSUE"]
     assert len(bom_issues) == 1
     assert "expected=20" in bom_issues[0].message
     assert "actual=22" in bom_issues[0].message
+
+def test_bom_issue_under_issue_nonzero_actual_raises_under_issue_error():
+    # expected = 20, tolerance = 0.4, actual = 18.5 (actual < expected, diff = -1.5,
+    # actual은 0이 아님) -> BOM_UNDER_ISSUE. 이 테스트가 실제로 검증하려는 것은
+    # "출고가 있었지만 부족한 경우"와 "출고 행 자체가 없는 경우"(MISSING_MATERIAL_
+    # ISSUE)가 서로 다른 코드로 구분된다는 것이다.
+    issues = validate_bom_issues(
+        [_wo(planned_qty="10")],
+        [_bom_item(standard_qty="2", uom="EA")],
+        [_issue_row(issued_qty="18.5", uom="EA")],
+        [_material()],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "BOM_UNDER_ISSUE"
+    assert issues[0].severity == "ERROR"
+    assert "actual=18.5" in issues[0].message
+
+def test_bom_issue_issue_fully_returned_net_zero_is_under_issue_not_missing():
+    # ISSUE 20 + RETURN 20 = 순액 0. material_issue 행 자체는 존재하므로(즉
+    # issue_entry가 None이 아님) "출고 행이 없음"(MISSING_MATERIAL_ISSUE)이
+    # 아니라 "출고했지만 부족함"(BOM_UNDER_ISSUE)으로 분류해야 한다 — 설계
+    # 문서(design.md)의 MISSING_ISSUE 정의("BOMItem 있으나 Issue 0건")는 출고
+    # 행의 개수를 가리키는 것으로 해석했다. expected=20, actual=0, diff=-20.
+    issues = validate_bom_issues(
+        [_wo(planned_qty="10")],
+        [_bom_item(standard_qty="2", uom="EA")],
+        [
+            _issue_row(issued_qty="20", uom="EA", issue_type="ISSUE", source_row=2),
+            _issue_row(issued_qty="20", uom="EA", issue_type="RETURN", source_row=3),
+        ],
+        [_material()],
+    )
+    assert len(issues) == 1
+    assert issues[0].code == "BOM_UNDER_ISSUE"
+    assert issues[0].severity == "ERROR"
+    assert "actual=0" in issues[0].message
 
 def test_bom_issue_material_issue_return_reduces_net_quantity():
     # ISSUE 22 - RETURN 2 = net 20, matches expected exactly -> no issue
@@ -190,7 +227,8 @@ def test_bom_issue_material_issue_return_reduces_net_quantity():
     assert issues == []
 
 def test_bom_issue_missing_material_issue_treated_as_zero_actual():
-    # BOM has material but no material_issue at all for this WO -> actual = 0
+    # BOM has material but no material_issue row at all for this WO
+    # (issue_entry가 None) -> actual = 0, MISSING_MATERIAL_ISSUE / ERROR.
     issues = validate_bom_issues(
         [_wo(planned_qty="10")],
         [_bom_item(standard_qty="2", uom="EA")],
@@ -198,12 +236,14 @@ def test_bom_issue_missing_material_issue_treated_as_zero_actual():
         [_material()],
     )
     assert len(issues) == 1
-    assert issues[0].code == "BOM_ISSUE"
+    assert issues[0].code == "MISSING_MATERIAL_ISSUE"
+    assert issues[0].severity == "ERROR"
     assert "actual=0" in issues[0].message
     assert issues[0].source_row is None
 
 def test_bom_issue_material_not_in_bom_flagged():
-    # material_issue exists for a material with no BOM line -> expected = 0
+    # material_issue exists for a material with no BOM line(bom_entry가 None)
+    # -> expected = 0, NOT_IN_BOM / WARNING.
     issues = validate_bom_issues(
         [_wo(bom_version_id="BOM-EMPTY", planned_qty="10")],
         [],
@@ -211,7 +251,8 @@ def test_bom_issue_material_not_in_bom_flagged():
         [_material(material_code="MAT-999")],
     )
     assert len(issues) == 1
-    assert issues[0].code == "BOM_ISSUE"
+    assert issues[0].code == "NOT_IN_BOM"
+    assert issues[0].severity == "WARNING"
     assert issues[0].related_entity == "MAT-999"
 
 def test_bom_issue_uom_mismatch_returns_review_issue_without_estimating():
@@ -249,7 +290,8 @@ def _uom_conversion(material_code="MAT-003", from_uom="EA", to_uom="KG",
 
 def test_bom_issue_applies_material_specific_uom_conversion_within_tolerance():
     # 실제 MAT-003(EA->KG, factor=12.5)과 동일한 패턴: 환산 후 tolerance 이내면
-    # UOM_CONVERSION_MISSING이 아니라 정상적으로 BOM_ISSUE 비교가 이뤄져야 한다.
+    # UOM_CONVERSION_MISSING이 아니라 정상적으로 OVER/UNDER 등 4가지 판정
+    # 로직까지 이어져야 한다(이 케이스는 tolerance 이내라 issue 없음).
     # BOM 표준: 2KG x planned_qty(1) = 2KG. 출고 0.16EA x 12.5 = 2.0KG -> 정확히 일치.
     issues = validate_bom_issues(
         [_wo(bom_version_id="BOM-3", planned_qty="1")],
@@ -263,8 +305,9 @@ def test_bom_issue_applies_material_specific_uom_conversion_within_tolerance():
     assert issues == []
 
 def test_bom_issue_applies_uom_conversion_and_still_flags_when_over_tolerance():
-    # 환산은 되지만 환산된 수량이 tolerance를 벗어나면 여전히 BOM_ISSUE가 발생해야 한다.
-    # BOM 표준: 2KG. 출고 1EA x 12.5 = 12.5KG -> 크게 초과.
+    # 환산은 되지만 환산된 수량이 tolerance를 벗어나면 여전히 오류가 발생해야 한다.
+    # BOM 표준: 2KG. 출고 1EA x 12.5 = 12.5KG -> 크게 초과(actual > expected) ->
+    # BOM_OVER_ISSUE.
     issues = validate_bom_issues(
         [_wo(bom_version_id="BOM-3", planned_qty="1")],
         [_bom_item(bom_version_id="BOM-3", material_code="MAT-003",
@@ -275,7 +318,7 @@ def test_bom_issue_applies_uom_conversion_and_still_flags_when_over_tolerance():
                           conversion_factor="12.5")],
     )
     assert len(issues) == 1
-    assert issues[0].code == "BOM_ISSUE"
+    assert issues[0].code == "BOM_OVER_ISSUE"
     assert "actual=12.5" in issues[0].message
 
 def test_bom_issue_uses_global_conversion_when_no_material_specific_row():

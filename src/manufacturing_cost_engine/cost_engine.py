@@ -1467,10 +1467,15 @@ def resolve_ga_actual_rate(rate_rules, company_code, plant_code, fiscal_year, re
     밝혀지기 전까지는 두 필드를 reference_date로 쓸 근거가 없다.
 
     plant_code가 법적 "부문"과 동일하다고 이 함수가 단정하지 않는다 —
-    현재 30_contract.xlsx에는 plant_code/fiscal_year 컬럼이 없어 실제
-    데이터로 호출하면 사실상 항상 None이 들어와 조회 결과도 None이 된다.
-    이는 이번 단계에서 새 컬럼을 추가하지 않기로 한 결정에 따른 의도된
-    동작이며, 계산 비활성 상태를 그대로 반영한다.
+    30_contract.xlsx에는 plant_code/fiscal_year 컬럼이 모두 존재한다.
+    plant_code는 20_work_order.xlsx(20건 전부 plant_code="PL01") +
+    01_company_plant.xlsx(회사 전체 공장이 "PL01" 하나뿐)로 확정되는
+    구조적 사실이라 현재 "PL01"로 채워져 있다. fiscal_year는 이를 확정할
+    근거가 없어 여전히 None이다. plant_code가 채워졌다고 해서 실제
+    데이터로 호출 시 GA 실적요율 조회가 활성화되는 것은 아니다 —
+    fiscal_year가 None이라 이 함수의 필수 입력 중 하나가 이미 비어 있고,
+    설령 fiscal_year까지 채워지더라도 32_cost_rate_rule.xlsx 자체가 0행
+    이라 후보가 될 rule이 없어 조회 결과는 여전히 (None, None)이다.
 
     rate_type="GA", rate_kind="ACTUAL"인 행만 후보로 삼는다. priority가
     없으므로(이번 설계에서 제외) 정확히 1건만 매칭되어야 하며, 0건이거나

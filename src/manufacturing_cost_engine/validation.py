@@ -191,7 +191,11 @@ def validate_gl_balance(rows, file="24_gl_transaction.xlsx", sheet="gl_transacti
             ))
     return issues
 
-# BOM_ISSUE tolerance: max(abs_tolerance, abs(expected_qty) * pct_tolerance).
+# BOM 자재 출고량 비교 tolerance: max(abs_tolerance, abs(expected_qty) * pct_tolerance).
+# (validate_bom_issues()가 이 tolerance를 넘었을 때 보고하는 code는 NOT_IN_BOM/
+# MISSING_MATERIAL_ISSUE/BOM_OVER_ISSUE/BOM_UNDER_ISSUE 4가지로 나뉜다 — 이
+# tolerance 계산 자체는 그 4가지와 무관하게 동일하며, 14_tolerance_rule.xlsx의
+# rule_scope="BOM_ISSUE" 값과도 무관하다.)
 DEFAULT_BOM_TOLERANCE = {"abs": Decimal("0.01"), "pct": Decimal("0.02")}
 BOM_TOLERANCE_OVERRIDES = {
     "MAT-003": {"abs": Decimal("0.05"), "pct": Decimal("0.01")},
@@ -282,13 +286,38 @@ def validate_bom_issues(work_orders, bom_items, material_issues, materials,
                         sheet="material_issue"):
     """
     WO의 bom_version_id 기준 BOM 표준투입량과 material_issue 순출고량(ISSUE-RETURN)을
-    비교해 tolerance를 벗어나면 BOM_ISSUE를 생성한다.
-    BOM 미등재 자재(expected=0)와 미출고 자재(actual=0)도 동일 경로로 판정한다.
+    비교해 tolerance를 벗어나면 다음 4가지 상태 중 하나로 보고한다(설계 문서
+    phase1_dataset_design.md/phase1_dataset_build_spec.md의 BOM 오류 카탈로그와
+    동일한 코드·심각도 체계):
+
+      - NOT_IN_BOM / WARNING: 그 WO의 BOM에 해당 자재 항목이 없는데(bom_entry
+        없음) material_issue가 존재해 tolerance를 벗어난 경우.
+      - MISSING_MATERIAL_ISSUE / ERROR: BOM에는 그 자재가 있는데(bom_entry
+        있음) 그 WO에 대한 material_issue 행이 **한 건도 없는**(issue_entry
+        자체가 없음) 경우. issue_entry가 존재하지만 ISSUE−RETURN 순액이
+        0인 경우(출고했다가 전부 반납)는 이 코드가 아니라 BOM_UNDER_ISSUE로
+        분류한다 — "출고 행이 없음"과 "출고했지만 순액이 0으로 부족함"은
+        설계 문서가 구분하는 서로 다른 상태이기 때문이다(design.md의
+        MISSING_ISSUE 정의가 "BOMItem 있으나 Issue 0**건**"이라고 명시하는
+        것은 행 개수를 가리키는 것으로 해석했다 — 순출고량이 0이 되는
+        경우까지 포함한다는 근거는 없다).
+      - BOM_OVER_ISSUE / ERROR: bom_entry와 issue_entry가 둘 다 있고
+        실제 순출고가 예상투입보다 tolerance를 초과해 많은 경우.
+      - BOM_UNDER_ISSUE / ERROR: bom_entry와 issue_entry가 둘 다 있고
+        실제 순출고가 예상투입보다 tolerance를 초과해 적은 경우(순액이
+        0인 경우 포함).
 
     BOM uom과 issue uom이 다르면(그리고 issue uom이 한 종류로 일관될 때) 먼저
     06_uom_conversion.xlsx에서 환산계수를 찾아 적용한다(자재별 환산이 전역 환산보다
     우선, §7-12). 환산계수를 찾지 못하면(행 자체가 없거나 factor가 비어 있으면)
-    기존과 동일하게 UOM_CONVERSION_MISSING을 보고하고 BOM_ISSUE 비교는 건너뛴다.
+    기존과 동일하게 UOM_CONVERSION_MISSING을 보고하고 이 4가지 상태 판정은
+    건너뛴다.
+
+    [tolerance_rule과의 축 분리 — 변경하지 않음] 이 함수의 tolerance 계산
+    (_bom_tolerance())은 14_tolerance_rule.xlsx를 전혀 읽지 않는다. 그
+    Excel의 rule_scope="BOM_ISSUE" 값은 validate_tolerance_rules()가 규칙
+    중복(모호성)을 탐지하는 데만 쓰이는 별도 축이며, 이번에 4가지 코드로
+    나눈 것과 무관하다 — rule_scope 값 자체를 바꾸지 않았다.
     """
     issues = []
     bom_index = _index_bom_items(bom_items)
@@ -344,8 +373,17 @@ def validate_bom_issues(work_orders, bom_items, material_issues, materials,
             tolerance = _bom_tolerance(material_code, expected_qty)
 
             if abs(difference) > tolerance:
+                if bom_entry is None:
+                    code, severity = "NOT_IN_BOM", "WARNING"
+                elif issue_entry is None:
+                    code, severity = "MISSING_MATERIAL_ISSUE", "ERROR"
+                elif difference > 0:
+                    code, severity = "BOM_OVER_ISSUE", "ERROR"
+                else:
+                    code, severity = "BOM_UNDER_ISSUE", "ERROR"
+
                 issues.append(_issue(
-                    "BOM_ISSUE", "ERROR", file, sheet, source_row,
+                    code, severity, file, sheet, source_row,
                     f"WO={wo_no}, material={material_code}: expected={expected_qty}, "
                     f"actual={actual_qty}, diff={difference}, tolerance={tolerance}",
                     material_code
